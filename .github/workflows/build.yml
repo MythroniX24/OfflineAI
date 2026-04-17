@@ -1,0 +1,133 @@
+name: Build APK
+
+# Triggers: push to main, any PR, or manual run from GitHub UI
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ── Step 1: Checkout code ────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Step 2: Clone llama.cpp (NDK dependency) ─────────────────────────────
+      # llama.cpp is NOT committed to the repo (too large).
+      # CI clones it fresh every time. Cached via actions/cache below.
+      - name: Cache llama.cpp clone
+        id: cache-llama
+        uses: actions/cache@v4
+        with:
+          path: app/src/main/cpp/llama.cpp
+          key: llama-cpp-${{ hashFiles('.llama-version') }}-v1
+          restore-keys: llama-cpp-
+
+      - name: Clone llama.cpp if not cached
+        if: steps.cache-llama.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 \
+            https://github.com/ggerganov/llama.cpp.git \
+            app/src/main/cpp/llama.cpp
+          echo "Cloned llama.cpp"
+
+      # ── Step 3: Set up JDK 17 ───────────────────────────────────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # ── Step 4: Cache Gradle ─────────────────────────────────────────────────
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      # ── Step 5: Install NDK and CMake via sdkmanager ─────────────────────────
+      # ubuntu-latest already has Android SDK + sdkmanager pre-installed
+      - name: Install NDK 26 and CMake 3.22
+        run: |
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager \
+            "ndk;26.3.11579264" \
+            "cmake;3.22.1" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            --sdk_root=$ANDROID_SDK_ROOT 2>/dev/null || true
+
+          echo "NDK path: $ANDROID_SDK_ROOT/ndk/26.3.11579264"
+          ls $ANDROID_SDK_ROOT/ndk/ || true
+
+      # ── Step 6: Make gradlew executable ─────────────────────────────────────
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      # ── Step 7: Build DEBUG APK ──────────────────────────────────────────────
+      - name: Build Debug APK
+        run: |
+          ./gradlew assembleDebug \
+            -Pandroid.ndkVersion=26.3.11579264 \
+            --no-daemon \
+            --stacktrace
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.3.11579264
+
+      # ── Step 8: Verify APK exists ────────────────────────────────────────────
+      - name: Verify APK output
+        run: |
+          APK_FILE="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK_FILE" ]; then
+            echo "ERROR: APK not found at $APK_FILE"
+            exit 1
+          fi
+          echo "APK found:"
+          ls -lh "$APK_FILE"
+
+      # ── Step 9: Rename APK with run number ──────────────────────────────────
+      - name: Rename APK
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/debug/app-debug.apk \
+             artifacts/OfflineAI-v${{ github.run_number }}-debug.apk
+          echo "✅ APK: artifacts/OfflineAI-v${{ github.run_number }}-debug.apk"
+
+      # ── Step 10: Upload APK as downloadable artifact ─────────────────────────
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OfflineAI-APK-v${{ github.run_number }}
+          path: artifacts/OfflineAI-v${{ github.run_number }}-debug.apk
+          retention-days: 60
+          if-no-files-found: error
+
+      # ── Step 11: GitHub Actions build summary ───────────────────────────────
+      - name: Write build summary
+        if: always()
+        run: |
+          echo "## 🤖 OfflineAI Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build # | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          if [ -f "artifacts/OfflineAI-v${{ github.run_number }}-debug.apk" ]; then
+            SIZE=$(du -sh artifacts/*.apk | cut -f1)
+            echo "| APK Size | $SIZE |" >> $GITHUB_STEP_SUMMARY
+            echo "| Status | ✅ Success |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Status | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi

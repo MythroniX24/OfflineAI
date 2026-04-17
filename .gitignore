@@ -1,0 +1,25 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Don't commit llama.cpp source (large, auto-cloned by CI)
+app/src/main/cpp/llama.cpp/
+
+# Don't commit model files
+*.gguf
+*.bin
+app/src/main/assets/models/
+
+# Build outputs
+app/build/
+*.apk
+*.aab
+*.keystore
+*.jks
