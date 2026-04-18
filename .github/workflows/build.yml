@@ -1,6 +1,5 @@
 name: Build APK
 
-# Triggers: push to main, any PR, or manual run from GitHub UI
 on:
   push:
     branches: [ main ]
@@ -15,13 +14,11 @@ jobs:
 
     steps:
 
-      # ── Step 1: Checkout code ────────────────────────────────────────────────
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── Step 2: Clone llama.cpp (NDK dependency) ─────────────────────────────
-      # llama.cpp is NOT committed to the repo (too large).
-      # CI clones it fresh every time. Cached via actions/cache below.
+      # ── 2. Cache llama.cpp ───────────────────────────────────────────────────
       - name: Cache llama.cpp clone
         id: cache-llama
         uses: actions/cache@v4
@@ -36,17 +33,31 @@ jobs:
           git clone --depth 1 \
             https://github.com/ggerganov/llama.cpp.git \
             app/src/main/cpp/llama.cpp
-          echo "Cloned llama.cpp"
 
-      # ── Step 3: Set up JDK 17 ───────────────────────────────────────────────
+      # ── 3. JDK 17 ────────────────────────────────────────────────────────────
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      # ── Step 4: Cache Gradle ─────────────────────────────────────────────────
-      - name: Cache Gradle dependencies
+      # ── 4. Download gradle-wrapper.jar ───────────────────────────────────────
+      #    gradlew script is in repo but gradle-wrapper.jar is a binary.
+      #    We download it from the official Gradle GitHub repo.
+      - name: Download gradle-wrapper.jar
+        run: |
+          mkdir -p gradle/wrapper
+          curl -fsSL \
+            "https://github.com/gradle/gradle/raw/v8.7.0/gradle/wrapper/gradle-wrapper.jar" \
+            -o gradle/wrapper/gradle-wrapper.jar
+          echo "Wrapper jar: $(ls -lh gradle/wrapper/gradle-wrapper.jar)"
+
+      # ── 5. Make gradlew executable ───────────────────────────────────────────
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      # ── 6. Cache Gradle dependencies ─────────────────────────────────────────
+      - name: Cache Gradle packages
         uses: actions/cache@v4
         with:
           path: |
@@ -56,25 +67,19 @@ jobs:
           restore-keys: |
             gradle-${{ runner.os }}-
 
-      # ── Step 5: Install NDK and CMake via sdkmanager ─────────────────────────
-      # ubuntu-latest already has Android SDK + sdkmanager pre-installed
-      - name: Install NDK 26 and CMake 3.22
+      # ── 7. Install NDK 26 and CMake 3.22 ─────────────────────────────────────
+      - name: Install NDK and CMake
         run: |
-          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager \
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | $SDKMANAGER \
             "ndk;26.3.11579264" \
             "cmake;3.22.1" \
             "platforms;android-35" \
             "build-tools;35.0.0" \
             --sdk_root=$ANDROID_SDK_ROOT 2>/dev/null || true
-
           echo "NDK path: $ANDROID_SDK_ROOT/ndk/26.3.11579264"
-          ls $ANDROID_SDK_ROOT/ndk/ || true
 
-      # ── Step 6: Make gradlew executable ─────────────────────────────────────
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
-
-      # ── Step 7: Build DEBUG APK ──────────────────────────────────────────────
+      # ── 8. Build Debug APK ────────────────────────────────────────────────────
       - name: Build Debug APK
         run: |
           ./gradlew assembleDebug \
@@ -84,27 +89,21 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.3.11579264
 
-      # ── Step 8: Verify APK exists ────────────────────────────────────────────
-      - name: Verify APK output
+      # ── 9. Verify and rename APK ──────────────────────────────────────────────
+      - name: Verify and rename APK
         run: |
-          APK_FILE="app/build/outputs/apk/debug/app-debug.apk"
-          if [ ! -f "$APK_FILE" ]; then
-            echo "ERROR: APK not found at $APK_FILE"
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK" ]; then
+            echo "ERROR: APK not found"
+            find app/build -name "*.apk" 2>/dev/null || true
             exit 1
           fi
-          echo "APK found:"
-          ls -lh "$APK_FILE"
-
-      # ── Step 9: Rename APK with run number ──────────────────────────────────
-      - name: Rename APK
-        run: |
           mkdir -p artifacts
-          cp app/build/outputs/apk/debug/app-debug.apk \
-             artifacts/OfflineAI-v${{ github.run_number }}-debug.apk
-          echo "✅ APK: artifacts/OfflineAI-v${{ github.run_number }}-debug.apk"
+          cp "$APK" "artifacts/OfflineAI-v${{ github.run_number }}-debug.apk"
+          ls -lh artifacts/
 
-      # ── Step 10: Upload APK as downloadable artifact ─────────────────────────
-      - name: Upload APK artifact
+      # ── 10. Upload APK artifact ───────────────────────────────────────────────
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: OfflineAI-APK-v${{ github.run_number }}
@@ -112,22 +111,19 @@ jobs:
           retention-days: 60
           if-no-files-found: error
 
-      # ── Step 11: GitHub Actions build summary ───────────────────────────────
-      - name: Write build summary
+      # ── 11. Summary ───────────────────────────────────────────────────────────
+      - name: Build summary
         if: always()
         run: |
-          echo "## 🤖 OfflineAI Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## OfflineAI Build" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| Build # | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Branch | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Triggered by | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
           if [ -f "artifacts/OfflineAI-v${{ github.run_number }}-debug.apk" ]; then
             SIZE=$(du -sh artifacts/*.apk | cut -f1)
             echo "| APK Size | $SIZE |" >> $GITHUB_STEP_SUMMARY
-            echo "| Status | ✅ Success |" >> $GITHUB_STEP_SUMMARY
+            echo "| Status | SUCCESS |" >> $GITHUB_STEP_SUMMARY
           else
-            echo "| Status | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+            echo "| Status | FAILED |" >> $GITHUB_STEP_SUMMARY
           fi
