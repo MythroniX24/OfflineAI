@@ -1,9 +1,28 @@
+import java.io.File
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.hilt)
     alias(libs.plugins.ksp)
+}
+
+// ── Clone llama.cpp before CMake runs (guaranteed) ────────────────────────────
+// This runs inside Gradle itself, so CMake always finds llama.h
+val cloneLlama = tasks.register<Exec>("cloneLlama") {
+    val target = File(projectDir, "src/main/cpp/llama.cpp")
+    onlyIf {
+        val hasLlama = File(target, "llama.h").exists()
+        if (hasLlama) logger.lifecycle("llama.cpp already present, skipping clone")
+        else logger.lifecycle("llama.cpp not found — cloning now...")
+        !hasLlama
+    }
+    commandLine(
+        "git", "clone", "--depth", "1",
+        "https://github.com/ggerganov/llama.cpp.git",
+        target.absolutePath
+    )
 }
 
 android {
@@ -19,7 +38,9 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // NDK ABI filters — support arm64 (modern) and x86_64 (emulator)
+        // Lock NDK version so Gradle doesn't auto-download a different one
+        ndkVersion = "26.3.11579264"
+
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }
@@ -56,6 +77,11 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+        // Suppress coroutines preview/experimental warnings
+        freeCompilerArgs += listOf(
+            "-opt-in=kotlinx.coroutines.FlowPreview",
+            "-opt-in=kotlinx.coroutines.ExperimentalCoroutinesApi"
+        )
     }
 
     buildFeatures {
@@ -73,6 +99,24 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+    }
+}
+
+// ── Wire cloneLlama to run before ANY CMake/native task ─────────────────────
+afterEvaluate {
+    // Hook into preBuild so llama.cpp is always present before compilation
+    tasks.named("preBuild").configure {
+        dependsOn(cloneLlama)
+    }
+    // Also hook all configureCMake tasks explicitly
+    tasks.matching { it.name.startsWith("configureCMake") }.configureEach {
+        dependsOn(cloneLlama)
+    }
+    tasks.matching { it.name.startsWith("generateJsonModel") }.configureEach {
+        dependsOn(cloneLlama)
+    }
+    tasks.matching { it.name.startsWith("buildCMake") }.configureEach {
+        dependsOn(cloneLlama)
     }
 }
 

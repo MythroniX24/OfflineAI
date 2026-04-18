@@ -25,22 +25,38 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      # ── 3. Clone llama.cpp (ALWAYS — cache is unreliable for large repos) ────
-      # We clone fresh every time so CMake always finds llama.h
+      # ── 3. Install NDK 26.3 and CMake 3.22 ───────────────────────────────────
+      # Must happen BEFORE Gradle build so Gradle doesn't auto-download NDK 26.1
+      - name: Install NDK 26.3.11579264 and CMake 3.22.1
+        run: |
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | $SDKMANAGER \
+            "ndk;26.3.11579264" \
+            "cmake;3.22.1" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" 2>/dev/null || true
+          # Export the correct NDK path for subsequent steps
+          echo "NDK_PATH=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> $GITHUB_ENV
+          ls "$ANDROID_SDK_ROOT/ndk/26.3.11579264/" | head -5
+
+      # ── 4. Clone llama.cpp (first line of defence before Gradle clone task) ──
       - name: Clone llama.cpp
         run: |
           LLAMA_DIR="app/src/main/cpp/llama.cpp"
           if [ -f "$LLAMA_DIR/llama.h" ]; then
-            echo "llama.cpp already present, skipping clone"
+            echo "✅ llama.cpp already present"
           else
-            echo "Cloning llama.cpp..."
+            echo "Cloning llama.cpp (depth=1)..."
             git clone --depth 1 \
               https://github.com/ggerganov/llama.cpp.git \
               "$LLAMA_DIR"
+            echo "✅ Clone done"
           fi
-          echo "llama.h exists: $(ls $LLAMA_DIR/llama.h)"
+          # Hard fail if llama.h still missing
+          test -f "$LLAMA_DIR/llama.h" || { echo "❌ llama.h not found after clone!"; exit 1; }
+          echo "llama.h: OK"
 
-      # ── 4. Download gradle-wrapper.jar ───────────────────────────────────────
+      # ── 5. Download gradle-wrapper.jar ───────────────────────────────────────
       - name: Download gradle-wrapper.jar
         run: |
           mkdir -p gradle/wrapper
@@ -49,13 +65,12 @@ jobs:
               "https://github.com/gradle/gradle/raw/v8.7.0/gradle/wrapper/gradle-wrapper.jar" \
               -o gradle/wrapper/gradle-wrapper.jar
           fi
-          echo "Wrapper jar: $(ls -lh gradle/wrapper/gradle-wrapper.jar)"
 
-      # ── 5. Make gradlew executable ───────────────────────────────────────────
+      # ── 6. Make gradlew executable ───────────────────────────────────────────
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      # ── 6. Cache Gradle dependencies ─────────────────────────────────────────
+      # ── 7. Cache Gradle dependencies ─────────────────────────────────────────
       - name: Cache Gradle packages
         uses: actions/cache@v4
         with:
@@ -63,25 +78,10 @@ jobs:
             ~/.gradle/caches
             ~/.gradle/wrapper
           key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
-          restore-keys: |
-            gradle-${{ runner.os }}-
-
-      # ── 7. Install NDK 26 and CMake 3.22 ─────────────────────────────────────
-      - name: Install NDK and CMake
-        run: |
-          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          yes | $SDKMANAGER \
-            "ndk;26.3.11579264" \
-            "cmake;3.22.1" \
-            "platforms;android-34" \
-            "build-tools;34.0.0" \
-            --sdk_root=$ANDROID_SDK_ROOT 2>/dev/null || true
-          
-          # Verify NDK installed correctly
-          ls $ANDROID_SDK_ROOT/ndk/ || echo "NDK dir listing failed"
-          echo "Using NDK: $ANDROID_SDK_ROOT/ndk/26.3.11579264"
+          restore-keys: gradle-${{ runner.os }}-
 
       # ── 8. Build Debug APK ────────────────────────────────────────────────────
+      # NDK_PATH is set in step 3 via GITHUB_ENV so it's available here
       - name: Build Debug APK
         run: |
           ./gradlew assembleDebug \
@@ -89,18 +89,14 @@ jobs:
             --no-daemon \
             --stacktrace
         env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.3.11579264
-          ANDROID_NDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.3.11579264
+          ANDROID_NDK_HOME: ${{ env.NDK_PATH }}
+          ANDROID_NDK_ROOT: ${{ env.NDK_PATH }}
 
       # ── 9. Verify and rename APK ──────────────────────────────────────────────
       - name: Verify and rename APK
         run: |
           APK="app/build/outputs/apk/debug/app-debug.apk"
-          if [ ! -f "$APK" ]; then
-            echo "ERROR: APK not found"
-            find app/build -name "*.apk" 2>/dev/null || true
-            exit 1
-          fi
+          test -f "$APK" || { echo "❌ APK not found"; find app/build -name "*.apk" 2>/dev/null; exit 1; }
           mkdir -p artifacts
           cp "$APK" "artifacts/OfflineAI-v${{ github.run_number }}-debug.apk"
           ls -lh artifacts/
@@ -118,15 +114,14 @@ jobs:
       - name: Build summary
         if: always()
         run: |
-          echo "## OfflineAI Build" >> $GITHUB_STEP_SUMMARY
+          echo "## OfflineAI Build #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| Build | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${GITHUB_SHA::7} |" >> $GITHUB_STEP_SUMMARY
           if [ -f "artifacts/OfflineAI-v${{ github.run_number }}-debug.apk" ]; then
-            SIZE=$(du -sh artifacts/*.apk | cut -f1)
-            echo "| APK Size | $SIZE |" >> $GITHUB_STEP_SUMMARY
-            echo "| Status | SUCCESS |" >> $GITHUB_STEP_SUMMARY
+            echo "| Status | ✅ SUCCESS |" >> $GITHUB_STEP_SUMMARY
+            echo "| APK Size | $(du -sh artifacts/*.apk | cut -f1) |" >> $GITHUB_STEP_SUMMARY
           else
-            echo "| Status | FAILED |" >> $GITHUB_STEP_SUMMARY
+            echo "| Status | ❌ FAILED |" >> $GITHUB_STEP_SUMMARY
           fi
