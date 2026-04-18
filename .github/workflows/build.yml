@@ -18,38 +18,37 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Cache llama.cpp ───────────────────────────────────────────────────
-      - name: Cache llama.cpp clone
-        id: cache-llama
-        uses: actions/cache@v4
-        with:
-          path: app/src/main/cpp/llama.cpp
-          key: llama-cpp-${{ hashFiles('.llama-version') }}-v1
-          restore-keys: llama-cpp-
-
-      - name: Clone llama.cpp if not cached
-        if: steps.cache-llama.outputs.cache-hit != 'true'
-        run: |
-          git clone --depth 1 \
-            https://github.com/ggerganov/llama.cpp.git \
-            app/src/main/cpp/llama.cpp
-
-      # ── 3. JDK 17 ────────────────────────────────────────────────────────────
+      # ── 2. JDK 17 ────────────────────────────────────────────────────────────
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
+      # ── 3. Clone llama.cpp (ALWAYS — cache is unreliable for large repos) ────
+      # We clone fresh every time so CMake always finds llama.h
+      - name: Clone llama.cpp
+        run: |
+          LLAMA_DIR="app/src/main/cpp/llama.cpp"
+          if [ -f "$LLAMA_DIR/llama.h" ]; then
+            echo "llama.cpp already present, skipping clone"
+          else
+            echo "Cloning llama.cpp..."
+            git clone --depth 1 \
+              https://github.com/ggerganov/llama.cpp.git \
+              "$LLAMA_DIR"
+          fi
+          echo "llama.h exists: $(ls $LLAMA_DIR/llama.h)"
+
       # ── 4. Download gradle-wrapper.jar ───────────────────────────────────────
-      #    gradlew script is in repo but gradle-wrapper.jar is a binary.
-      #    We download it from the official Gradle GitHub repo.
       - name: Download gradle-wrapper.jar
         run: |
           mkdir -p gradle/wrapper
-          curl -fsSL \
-            "https://github.com/gradle/gradle/raw/v8.7.0/gradle/wrapper/gradle-wrapper.jar" \
-            -o gradle/wrapper/gradle-wrapper.jar
+          if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+            curl -fsSL \
+              "https://github.com/gradle/gradle/raw/v8.7.0/gradle/wrapper/gradle-wrapper.jar" \
+              -o gradle/wrapper/gradle-wrapper.jar
+          fi
           echo "Wrapper jar: $(ls -lh gradle/wrapper/gradle-wrapper.jar)"
 
       # ── 5. Make gradlew executable ───────────────────────────────────────────
@@ -77,7 +76,10 @@ jobs:
             "platforms;android-34" \
             "build-tools;34.0.0" \
             --sdk_root=$ANDROID_SDK_ROOT 2>/dev/null || true
-          echo "NDK path: $ANDROID_SDK_ROOT/ndk/26.3.11579264"
+          
+          # Verify NDK installed correctly
+          ls $ANDROID_SDK_ROOT/ndk/ || echo "NDK dir listing failed"
+          echo "Using NDK: $ANDROID_SDK_ROOT/ndk/26.3.11579264"
 
       # ── 8. Build Debug APK ────────────────────────────────────────────────────
       - name: Build Debug APK
@@ -88,6 +90,7 @@ jobs:
             --stacktrace
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.3.11579264
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.3.11579264
 
       # ── 9. Verify and rename APK ──────────────────────────────────────────────
       - name: Verify and rename APK

@@ -294,7 +294,7 @@ private fun InputRow(
             FilledIconButton(
                 onClick = if (isGenerating) onStop else onSend,
                 enabled = isGenerating || text.isNotBlank(),
-                containerColor = MaterialTheme.colorScheme.primary
+                colors = IconButtonDefaults.filledIconButtonColors(containerColor = MaterialTheme.colorScheme.primary)
             ) {
                 Icon(
                     imageVector = if (isGenerating) Icons.Default.Stop else Icons.Default.Send,
