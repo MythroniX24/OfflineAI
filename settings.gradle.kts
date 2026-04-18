@@ -16,6 +16,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // JitPack — needed for compose-markdown (com.github.jeziellago)
+        maven { url = uri("https://jitpack.io") }
     }
 }
 
