@@ -1,8 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.OfflineAI" parent="android:Theme.Material.NoTitleBar">
+    <!-- Base theme for Compose app — NoActionBar so Compose handles everything -->
+    <style name="Theme.OfflineAI" parent="android:Theme.Material.Light.NoActionBar">
         <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:statusBarColor">@android:color/black</item>
+        <item name="android:navigationBarColor">@android:color/black</item>
     </style>
+
+    <!-- Splash screen theme (androidx.core:core-splashscreen) -->
     <style name="Theme.OfflineAI.Splash" parent="Theme.SplashScreen">
         <item name="windowSplashScreenBackground">#0D1117</item>
         <item name="windowSplashScreenAnimatedIcon">@drawable/ic_splash</item>
