@@ -3,28 +3,24 @@ project("offlineai")
 
 set(LLAMA_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp")
 
-# ── Newer llama.cpp moved llama.h to include/llama.h ─────────────────────────
-# Check both old path (root) and new path (include/)
+# Accept both old and new llama.cpp header locations
 if(EXISTS "${LLAMA_SRC_DIR}/llama.h")
-    set(LLAMA_H_FOUND TRUE)
+    message(STATUS "Found llama.h at root")
 elseif(EXISTS "${LLAMA_SRC_DIR}/include/llama.h")
-    set(LLAMA_H_FOUND TRUE)
+    message(STATUS "Found llama.h at include/")
 else()
-    set(LLAMA_H_FOUND FALSE)
+    message(FATAL_ERROR "llama.cpp sources not found at ${LLAMA_SRC_DIR}")
 endif()
 
-if(NOT LLAMA_H_FOUND)
-    message(FATAL_ERROR
-        "llama.cpp sources not found at ${LLAMA_SRC_DIR}\n"
-        "Run: git clone https://github.com/ggerganov/llama.cpp.git app/src/main/cpp/llama.cpp"
-    )
-endif()
-
-# ── Compiler flags ────────────────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 17)
-add_compile_options(-O3 -ffast-math -fno-exceptions -DNDEBUG)
 
-# Disable GPU backends on Android (CPU only)
+# ── IMPORTANT: Do NOT set -fno-exceptions or -ffast-math globally ─────────────
+# llama.cpp's own files (gguf.cpp, ggml-cpu.c etc) need:
+#   - exceptions enabled  (try/catch in gguf.cpp)
+#   - finite math         (ggml-cpu vec.h checks __FINITE_MATH_ONLY__)
+# Only apply performance flags to OUR bridge file via target_compile_options
+
+# Disable GPU backends — CPU only for Android
 set(GGML_CUDA     OFF CACHE BOOL "" FORCE)
 set(GGML_METAL    OFF CACHE BOOL "" FORCE)
 set(GGML_OPENCL   OFF CACHE BOOL "" FORCE)
@@ -32,13 +28,15 @@ set(LLAMA_CUBLAS  OFF CACHE BOOL "" FORCE)
 set(LLAMA_CLBLAST OFF CACHE BOOL "" FORCE)
 set(LLAMA_METAL   OFF CACHE BOOL "" FORCE)
 
-# ── Add llama.cpp ─────────────────────────────────────────────────────────────
+# Add llama.cpp subdirectory — uses its own CMake flags, not ours
 add_subdirectory(${LLAMA_SRC_DIR} llama_build)
 
-# ── JNI Bridge ───────────────────────────────────────────────────────────────
+# ── Our JNI bridge ────────────────────────────────────────────────────────────
 add_library(llama_android SHARED llama_bridge.cpp)
 
-# Include both old and new header paths
+# Apply optimization ONLY to our file — safe because we don't use try/catch
+target_compile_options(llama_android PRIVATE -O3 -DNDEBUG)
+
 target_include_directories(llama_android PRIVATE
     ${LLAMA_SRC_DIR}
     ${LLAMA_SRC_DIR}/include
