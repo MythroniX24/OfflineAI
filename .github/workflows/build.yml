@@ -14,19 +14,15 @@ jobs:
 
     steps:
 
-      # ── 1. Checkout ──────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. JDK 17 ────────────────────────────────────────────────────────────
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      # ── 3. Install NDK 26.3 and CMake 3.22 ───────────────────────────────────
-      # Must happen BEFORE Gradle build so Gradle doesn't auto-download NDK 26.1
       - name: Install NDK 26.3.11579264 and CMake 3.22.1
         run: |
           SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
@@ -35,28 +31,30 @@ jobs:
             "cmake;3.22.1" \
             "platforms;android-34" \
             "build-tools;34.0.0" 2>/dev/null || true
-          # Export the correct NDK path for subsequent steps
           echo "NDK_PATH=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> $GITHUB_ENV
-          ls "$ANDROID_SDK_ROOT/ndk/26.3.11579264/" | head -5
 
-      # ── 4. Clone llama.cpp (first line of defence before Gradle clone task) ──
+      # ── Clone llama.cpp + verify with both old and new header paths ───────────
       - name: Clone llama.cpp
         run: |
           LLAMA_DIR="app/src/main/cpp/llama.cpp"
-          if [ -f "$LLAMA_DIR/llama.h" ]; then
-            echo "✅ llama.cpp already present"
-          else
-            echo "Cloning llama.cpp (depth=1)..."
-            git clone --depth 1 \
-              https://github.com/ggerganov/llama.cpp.git \
-              "$LLAMA_DIR"
-            echo "✅ Clone done"
-          fi
-          # Hard fail if llama.h still missing
-          test -f "$LLAMA_DIR/llama.h" || { echo "❌ llama.h not found after clone!"; exit 1; }
-          echo "llama.h: OK"
+          echo "Cloning llama.cpp (depth=1)..."
+          git clone --depth 1 \
+            https://github.com/ggerganov/llama.cpp.git \
+            "$LLAMA_DIR"
 
-      # ── 5. Download gradle-wrapper.jar ───────────────────────────────────────
+          # Newer llama.cpp has llama.h in include/ not root
+          # Accept either location
+          if [ -f "$LLAMA_DIR/llama.h" ]; then
+            echo "✅ Found llama.h at root"
+          elif [ -f "$LLAMA_DIR/include/llama.h" ]; then
+            echo "✅ Found llama.h at include/"
+          else
+            echo "❌ llama.h not found in root or include/"
+            echo "Contents of cloned dir:"
+            ls "$LLAMA_DIR/" | head -20
+            exit 1
+          fi
+
       - name: Download gradle-wrapper.jar
         run: |
           mkdir -p gradle/wrapper
@@ -66,11 +64,9 @@ jobs:
               -o gradle/wrapper/gradle-wrapper.jar
           fi
 
-      # ── 6. Make gradlew executable ───────────────────────────────────────────
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      # ── 7. Cache Gradle dependencies ─────────────────────────────────────────
       - name: Cache Gradle packages
         uses: actions/cache@v4
         with:
@@ -80,8 +76,6 @@ jobs:
           key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
           restore-keys: gradle-${{ runner.os }}-
 
-      # ── 8. Build Debug APK ────────────────────────────────────────────────────
-      # NDK_PATH is set in step 3 via GITHUB_ENV so it's available here
       - name: Build Debug APK
         run: |
           ./gradlew assembleDebug \
@@ -92,7 +86,6 @@ jobs:
           ANDROID_NDK_HOME: ${{ env.NDK_PATH }}
           ANDROID_NDK_ROOT: ${{ env.NDK_PATH }}
 
-      # ── 9. Verify and rename APK ──────────────────────────────────────────────
       - name: Verify and rename APK
         run: |
           APK="app/build/outputs/apk/debug/app-debug.apk"
@@ -101,7 +94,6 @@ jobs:
           cp "$APK" "artifacts/OfflineAI-v${{ github.run_number }}-debug.apk"
           ls -lh artifacts/
 
-      # ── 10. Upload APK artifact ───────────────────────────────────────────────
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
@@ -110,7 +102,6 @@ jobs:
           retention-days: 60
           if-no-files-found: error
 
-      # ── 11. Summary ───────────────────────────────────────────────────────────
       - name: Build summary
         if: always()
         run: |
@@ -118,7 +109,6 @@ jobs:
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Commit | ${GITHUB_SHA::7} |" >> $GITHUB_STEP_SUMMARY
           if [ -f "artifacts/OfflineAI-v${{ github.run_number }}-debug.apk" ]; then
             echo "| Status | ✅ SUCCESS |" >> $GITHUB_STEP_SUMMARY
             echo "| APK Size | $(du -sh artifacts/*.apk | cut -f1) |" >> $GITHUB_STEP_SUMMARY
