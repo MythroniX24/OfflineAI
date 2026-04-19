@@ -1,28 +1,9 @@
-import java.io.File
-
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.hilt)
     alias(libs.plugins.ksp)
-}
-
-// ── Clone llama.cpp before CMake runs (guaranteed) ────────────────────────────
-// This runs inside Gradle itself, so CMake always finds llama.h
-val cloneLlama = tasks.register<Exec>("cloneLlama") {
-    val target = File(projectDir, "src/main/cpp/llama.cpp")
-    onlyIf {
-        val hasLlama = File(target, "llama.h").exists()
-        if (hasLlama) logger.lifecycle("llama.cpp already present, skipping clone")
-        else logger.lifecycle("llama.cpp not found — cloning now...")
-        !hasLlama
-    }
-    commandLine(
-        "git", "clone", "--depth", "1",
-        "https://github.com/ggerganov/llama.cpp.git",
-        target.absolutePath
-    )
 }
 
 android {
@@ -38,7 +19,7 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // Lock NDK version so Gradle doesn't auto-download a different one
+        // Pin exact NDK version — prevents Gradle from auto-downloading 26.1
         ndkVersion = "26.3.11579264"
 
         ndk {
@@ -77,7 +58,6 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
-        // Suppress coroutines preview/experimental warnings
         freeCompilerArgs += listOf(
             "-opt-in=kotlinx.coroutines.FlowPreview",
             "-opt-in=kotlinx.coroutines.ExperimentalCoroutinesApi"
@@ -102,24 +82,6 @@ android {
     }
 }
 
-// ── Wire cloneLlama to run before ANY CMake/native task ─────────────────────
-afterEvaluate {
-    // Hook into preBuild so llama.cpp is always present before compilation
-    tasks.named("preBuild").configure {
-        dependsOn(cloneLlama)
-    }
-    // Also hook all configureCMake tasks explicitly
-    tasks.matching { it.name.startsWith("configureCMake") }.configureEach {
-        dependsOn(cloneLlama)
-    }
-    tasks.matching { it.name.startsWith("generateJsonModel") }.configureEach {
-        dependsOn(cloneLlama)
-    }
-    tasks.matching { it.name.startsWith("buildCMake") }.configureEach {
-        dependsOn(cloneLlama)
-    }
-}
-
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -128,7 +90,6 @@ dependencies {
     implementation(libs.androidx.splashscreen)
     implementation(libs.androidx.work.runtime)
 
-    // Compose
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.ui)
     implementation(libs.androidx.ui.graphics)
@@ -136,32 +97,22 @@ dependencies {
     implementation(libs.androidx.material3)
     implementation(libs.androidx.material.icons)
 
-    // Navigation
     implementation(libs.androidx.navigation.compose)
 
-    // Hilt
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)
     implementation(libs.hilt.navigation.compose)
 
-    // Room
     implementation(libs.room.runtime)
     implementation(libs.room.ktx)
     ksp(libs.room.compiler)
 
-    // Coroutines
     implementation(libs.kotlinx.coroutines.android)
-
-    // DataStore
     implementation(libs.androidx.datastore.preferences)
 
-    // Markdown rendering
     implementation("com.github.jeziellago:compose-markdown:0.5.0")
-
-    // Gson
     implementation(libs.gson)
 
-    // Testing
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
