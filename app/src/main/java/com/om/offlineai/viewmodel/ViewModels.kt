@@ -1,13 +1,8 @@
 package com.om.offlineai.viewmodel
 
-import android.app.DownloadManager
-import android.content.BroadcastReceiver
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
-import android.database.Cursor
 import android.net.Uri
-import android.os.Build
+import android.os.Environment
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.om.offlineai.data.db.entities.*
@@ -43,6 +38,13 @@ val DOWNLOADABLE_MODELS = listOf(
         recommended = true
     ),
     DownloadableModel(
+        name = "Qwen2 1.5B",
+        description = "Hindi/Hinglish ke liye best. Chhota aur efficient.",
+        sizeMB = 940,
+        url = "https://huggingface.co/Qwen/Qwen2-1.5B-Instruct-GGUF/resolve/main/qwen2-1_5b-instruct-q4_k_m.gguf",
+        fileName = "qwen2-1_5b-instruct-q4_k_m.gguf"
+    ),
+    DownloadableModel(
         name = "Phi-2 (2.7B)",
         description = "Microsoft ka model. Zyada smart, thoda bada.",
         sizeMB = 1600,
@@ -55,13 +57,6 @@ val DOWNLOADABLE_MODELS = listOf(
         sizeMB = 1500,
         url = "https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf",
         fileName = "gemma-2-2b-it-q4_k_m.gguf"
-    ),
-    DownloadableModel(
-        name = "Qwen2 1.5B",
-        description = "Hindi/Hinglish ke liye best. Chhota aur efficient.",
-        sizeMB = 940,
-        url = "https://huggingface.co/Qwen/Qwen2-1.5B-Instruct-GGUF/resolve/main/qwen2-1_5b-instruct-q4_k_m.gguf",
-        fileName = "qwen2-1_5b-instruct-q4_k_m.gguf"
     )
 )
 
@@ -98,148 +93,44 @@ class ModelViewModel @Inject constructor(
     private val _uiState = MutableStateFlow(ModelUiState())
     val uiState: StateFlow<ModelUiState> = _uiState.asStateFlow()
 
-    private var downloadId: Long = -1L
-    private var progressJob: Job? = null
-    private val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-
-    // Receiver for download complete
-    private val downloadReceiver = object : BroadcastReceiver() {
-        override fun onReceive(ctx: Context, intent: Intent) {
-            val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1)
-            if (id == downloadId) onDownloadComplete(id)
-        }
-    }
+    // ── Download helper ───────────────────────────────────────────────────────
+    private val downloader = ModelDownloadHelper(
+        context   = context,
+        uiState   = _uiState,
+        onComplete = { path -> loadModel(path) },
+        scope     = viewModelScope
+    )
 
     init {
         engine.init()
-        // Register download complete receiver
-        val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            context.registerReceiver(downloadReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            context.registerReceiver(downloadReceiver, filter)
-        }
-
         viewModelScope.launch {
             val settings = settingsRepo.get()
             if (settings.modelPath.isNotBlank() && File(settings.modelPath).exists()) {
-                _uiState.update { it.copy(modelPath = settings.modelPath, modelName = settings.modelName) }
-                loadModel(settings.modelPath)
-            }
-        }
-    }
-
-    // ── Download model from URL ───────────────────────────────────────────────
-    fun downloadModel(model: DownloadableModel) {
-        if (_uiState.value.isDownloading) return
-
-        val modelsDir = File(context.filesDir, "models").also { it.mkdirs() }
-        val destFile = File(modelsDir, model.fileName)
-
-        // Already downloaded?
-        if (destFile.exists() && destFile.length() > 1024 * 1024) {
-            loadModel(destFile.absolutePath)
-            return
-        }
-
-        _uiState.update {
-            it.copy(
-                isDownloading = true,
-                downloadProgress = 0f,
-                downloadingModel = model.name,
-                totalMB = model.sizeMB,
-                downloadedMB = 0,
-                error = null
-            )
-        }
-
-        val request = DownloadManager.Request(Uri.parse(model.url))
-            .setTitle("Downloading ${model.name}")
-            .setDescription("OfflineAI model download")
-            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
-            .setDestinationUri(Uri.fromFile(destFile))
-            .setAllowedOverMetered(true)
-            .setAllowedOverRoaming(true)
-
-        downloadId = downloadManager.enqueue(request)
-
-        // Poll progress every second
-        progressJob = viewModelScope.launch {
-            while (_uiState.value.isDownloading) {
-                updateDownloadProgress()
-                delay(1000)
-            }
-        }
-    }
-
-    private fun updateDownloadProgress() {
-        if (downloadId < 0) return
-        val query = DownloadManager.Query().setFilterById(downloadId)
-        val cursor: Cursor = downloadManager.query(query) ?: return
-        if (!cursor.moveToFirst()) { cursor.close(); return }
-
-        val status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
-        val downloaded = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
-        val total = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
-        cursor.close()
-
-        when (status) {
-            DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PENDING -> {
-                val progress = if (total > 0) downloaded.toFloat() / total else 0f
                 _uiState.update {
-                    it.copy(
-                        downloadProgress = progress,
-                        downloadedMB = (downloaded / (1024 * 1024)).toInt(),
-                        totalMB = (total / (1024 * 1024)).toInt()
-                    )
+                    it.copy(modelPath = settings.modelPath, modelName = settings.modelName)
                 }
-            }
-            DownloadManager.STATUS_FAILED -> {
-                progressJob?.cancel()
-                _uiState.update {
-                    it.copy(isDownloading = false, error = "Download failed. Check internet connection.")
+                // Don't auto-load if a download is already in progress
+                if (!_uiState.value.isDownloading) {
+                    loadModel(settings.modelPath)
                 }
             }
         }
     }
 
-    fun cancelDownload() {
-        if (downloadId >= 0) downloadManager.remove(downloadId)
-        progressJob?.cancel()
-        downloadId = -1L
-        _uiState.update { it.copy(isDownloading = false, downloadProgress = 0f) }
-    }
-
-    private fun onDownloadComplete(id: Long) {
-        progressJob?.cancel()
-        val query = DownloadManager.Query().setFilterById(id)
-        val cursor = downloadManager.query(query) ?: return
-        if (!cursor.moveToFirst()) { cursor.close(); return }
-
-        val status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
-        val localUri = cursor.getString(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI))
-        cursor.close()
-
-        if (status == DownloadManager.STATUS_SUCCESSFUL && localUri != null) {
-            val path = Uri.parse(localUri).path ?: return
-            _uiState.update { it.copy(isDownloading = false, downloadProgress = 1f) }
-            viewModelScope.launch { loadModel(path) }
-        } else {
-            _uiState.update {
-                it.copy(isDownloading = false, error = "Download failed (status=$status)")
-            }
-        }
-    }
+    // ── Download ──────────────────────────────────────────────────────────────
+    fun downloadModel(model: DownloadableModel) = downloader.startDownload(model)
+    fun cancelDownload() = downloader.cancel()
 
     // ── Import from file picker ───────────────────────────────────────────────
     fun importModel(uri: Uri) {
         viewModelScope.launch {
             _uiState.update { it.copy(isImporting = true, error = null, importProgress = 0f) }
             try {
-                val modelsDir = File(context.filesDir, "models").also { it.mkdirs() }
-                val fileName = resolveFileName(uri) ?: "model.gguf"
-                val destFile = File(modelsDir, fileName)
+                val destDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                    ?: context.filesDir
+                destDir.mkdirs()
+                val fileName  = resolveFileName(uri) ?: "model.gguf"
+                val destFile  = File(destDir, fileName)
 
                 val sizeMB = context.contentResolver.openFileDescriptor(uri, "r")?.use {
                     it.statSize / (1024 * 1024)
@@ -249,7 +140,7 @@ class ModelViewModel @Inject constructor(
                     _uiState.update {
                         it.copy(
                             isImporting = false,
-                            deviceWarning = "⚠️ Model ${sizeMB}MB — only ${deviceCapability.profile().ramMB}MB RAM available. May crash."
+                            deviceWarning = "⚠️ Model ${sizeMB}MB — only ${deviceCapability.profile().ramMB}MB RAM. May crash."
                         )
                     }
                     return@launch
@@ -261,8 +152,7 @@ class ModelViewModel @Inject constructor(
                         val total = sizeMB * 1024 * 1024
                         var copied = 0L; var n: Int
                         while (input.read(buf).also { n = it } != -1) {
-                            output.write(buf, 0, n)
-                            copied += n
+                            output.write(buf, 0, n); copied += n
                             if (total > 0) _uiState.update {
                                 it.copy(importProgress = copied.toFloat() / total)
                             }
@@ -283,22 +173,21 @@ class ModelViewModel @Inject constructor(
         viewModelScope.launch {
             _uiState.update { it.copy(state = ModelState.Loading) }
             val success = engine.loadModel(path)
-            val f = File(path)
             if (success) {
-                val info = engine.getModelInfo()
+                val f = File(path)
                 settingsRepo.updateModel(path, f.name)
                 _uiState.update {
                     it.copy(
-                        state = engine.modelState,
+                        state     = engine.modelState,
                         modelPath = path,
                         modelName = f.name,
                         modelSizeMB = f.length() / (1024 * 1024),
-                        modelInfo = info
+                        modelInfo = engine.getModelInfo()
                     )
                 }
                 seedDefaultsIfNeeded()
             } else {
-                _uiState.update { it.copy(state = engine.modelState, error = "Failed to load model") }
+                _uiState.update { it.copy(state = engine.modelState, error = "Model load nahi hua") }
             }
         }
     }
@@ -313,14 +202,18 @@ class ModelViewModel @Inject constructor(
         }
     }
 
-    fun reloadModel() { val path = _uiState.value.modelPath; if (path.isNotBlank()) loadModel(path) }
-    fun clearError() = _uiState.update { it.copy(error = null) }
+    fun reloadModel() {
+        val path = _uiState.value.modelPath
+        if (path.isNotBlank()) loadModel(path)
+    }
+
+    fun clearError()   = _uiState.update { it.copy(error = null) }
     fun clearWarning() = _uiState.update { it.copy(deviceWarning = null) }
 
     private fun resolveFileName(uri: Uri): String? {
-        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-            if (cursor.moveToFirst() && idx >= 0) return cursor.getString(idx)
+        context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+            val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (c.moveToFirst() && idx >= 0) return c.getString(idx)
         }
         return uri.lastPathSegment
     }
@@ -334,10 +227,11 @@ class ModelViewModel @Inject constructor(
 
     override fun onCleared() {
         super.onCleared()
-        progressJob?.cancel()
-        try { context.unregisterReceiver(downloadReceiver) } catch (_: Exception) {}
+        downloader.destroy()
         engine.destroy()
     }
+}
+
 }
 
 // ═══════════════════════════════════════════════════════════════════
