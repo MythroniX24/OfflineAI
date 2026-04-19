@@ -23,6 +23,8 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.om.offlineai.data.db.entities.Conversation
 import com.om.offlineai.engine.ModelState
+import com.om.offlineai.viewmodel.DOWNLOADABLE_MODELS
+import com.om.offlineai.viewmodel.DownloadableModel
 import com.om.offlineai.viewmodel.*
 import java.text.SimpleDateFormat
 import java.util.*
@@ -239,7 +241,7 @@ private fun ConversationItem(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Model Setup Screen
+//  Model Setup Screen — with built-in download support
 // ═══════════════════════════════════════════════════════════════════
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -252,85 +254,125 @@ fun ModelSetupScreen(
         ActivityResultContracts.GetContent()
     ) { uri: Uri? -> uri?.let { vm.importModel(it) } }
 
-    // Navigate away when model loaded
     LaunchedEffect(state.state) {
         if (state.state is ModelState.Loaded) onModelLoaded()
     }
 
     Scaffold(containerColor = MaterialTheme.colorScheme.background) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().padding(padding),
+            contentPadding = PaddingValues(horizontal = 20.dp, vertical = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            Icon(Icons.Default.SmartToy, contentDescription = null,
-                modifier = Modifier.size(80.dp),
-                tint = MaterialTheme.colorScheme.primary)
-            Spacer(Modifier.height(24.dp))
-            Text("Welcome to OfflineAI", style = MaterialTheme.typography.headlineMedium)
-            Spacer(Modifier.height(8.dp))
-            Text("Import a GGUF model to get started.\nRecommended: TinyLlama Q4_0 (~700MB)",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-
-            Spacer(Modifier.height(32.dp))
-
-            when (val s = state.state) {
-                is ModelState.Loading -> {
-                    CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
-                    if (state.isImporting) {
-                        Spacer(Modifier.height(12.dp))
-                        LinearProgressIndicator(
-                            progress = { state.importProgress },
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        Text("Importing… ${(state.importProgress * 100).toInt()}%",
-                            style = MaterialTheme.typography.labelSmall)
-                    } else {
-                        Spacer(Modifier.height(8.dp))
-                        Text("Loading model…", style = MaterialTheme.typography.labelMedium)
-                    }
+            // ── Header ──────────────────────────────────────────────
+            item {
+                Column(horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Default.SmartToy, null,
+                        modifier = Modifier.size(72.dp),
+                        tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.height(12.dp))
+                    Text("OfflineAI", style = MaterialTheme.typography.headlineMedium)
+                    Text("Pehle ek model download ya import karo",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                is ModelState.Error -> {
-                    Text(s.message, color = MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.bodySmall)
-                    Spacer(Modifier.height(16.dp))
-                    ImportButton { launcher.launch("*/*") }
-                }
-                else -> ImportButton { launcher.launch("*/*") }
             }
 
-            state.deviceWarning?.let { warn ->
-                Spacer(Modifier.height(16.dp))
-                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
-                    Row(Modifier.padding(12.dp)) {
-                        Icon(Icons.Default.Warning, contentDescription = null,
-                            tint = MaterialTheme.colorScheme.error)
-                        Spacer(Modifier.width(8.dp))
-                        Column {
-                            Text(warn, style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onErrorContainer)
-                            TextButton(onClick = { vm.clearWarning(); launcher.launch("*/*") }) {
-                                Text("Import anyway")
+            // ── Error / Loading / Download Progress ─────────────────
+            item {
+                when {
+                    state.isDownloading -> {
+                        DownloadProgressCard(
+                            modelName = state.downloadingModel,
+                            progress = state.downloadProgress,
+                            downloadedMB = state.downloadedMB,
+                            totalMB = state.totalMB,
+                            onCancel = { vm.cancelDownload() }
+                        )
+                    }
+                    state.isImporting || state.state is ModelState.Loading -> {
+                        LoadingCard(
+                            message = when {
+                                state.isImporting -> "Importing… ${(state.importProgress * 100).toInt()}%"
+                                else -> "Model load ho raha hai…"
+                            },
+                            progress = if (state.isImporting) state.importProgress else null
+                        )
+                    }
+                    state.error != null -> {
+                        Card(colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer)) {
+                            Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Error, null, tint = MaterialTheme.colorScheme.error)
+                                Spacer(Modifier.width(8.dp))
+                                Text(state.error!!, style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                    modifier = Modifier.weight(1f))
+                                IconButton(onClick = { vm.clearError() }, modifier = Modifier.size(32.dp)) {
+                                    Icon(Icons.Default.Close, null, modifier = Modifier.size(16.dp))
+                                }
                             }
                         }
                     }
                 }
             }
 
-            Spacer(Modifier.height(32.dp))
-            // Help card
-            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
-                Column(Modifier.padding(16.dp)) {
-                    Text("Where to get models?", style = MaterialTheme.typography.labelLarge)
-                    Spacer(Modifier.height(4.dp))
-                    Text("• HuggingFace → search 'TinyLlama GGUF'\n• TheBloke models (Q4_0 variants)\n• Phi-2, Gemma-2B, Mistral 7B Q4\n\nCopy .gguf file to your phone, then import.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+            // ── Download models section ──────────────────────────────
+            if (!state.isDownloading && state.state !is ModelState.Loading) {
+                item {
+                    Text("📥  App se seedha download karo",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.primary)
+                }
+
+                items(DOWNLOADABLE_MODELS) { model ->
+                    DownloadableModelCard(
+                        model = model,
+                        onDownload = { vm.downloadModel(model) }
+                    )
+                }
+
+                // ── Divider ──────────────────────────────────────────
+                item {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        HorizontalDivider(Modifier.weight(1f))
+                        Text("  ya  ", style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        HorizontalDivider(Modifier.weight(1f))
+                    }
+                }
+
+                // ── Manual import ────────────────────────────────────
+                item {
+                    OutlinedButton(
+                        onClick = { launcher.launch("*/*") },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.FolderOpen, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Phone se .gguf file import karo")
+                    }
+                }
+            }
+
+            // ── Device warning ───────────────────────────────────────
+            state.deviceWarning?.let { warn ->
+                item {
+                    Card(colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer)) {
+                        Row(Modifier.padding(12.dp)) {
+                            Icon(Icons.Default.Warning, null, tint = MaterialTheme.colorScheme.error)
+                            Spacer(Modifier.width(8.dp))
+                            Column {
+                                Text(warn, style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onErrorContainer)
+                                TextButton(onClick = { vm.clearWarning(); launcher.launch("*/*") }) {
+                                    Text("Phir bhi import karo")
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -338,9 +380,109 @@ fun ModelSetupScreen(
 }
 
 @Composable
+private fun DownloadableModelCard(
+    model: DownloadableModel,
+    onDownload: () -> Unit
+) {
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = if (model.recommended)
+                MaterialTheme.colorScheme.primaryContainer
+            else MaterialTheme.colorScheme.surfaceVariant
+        )
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(model.name, style = MaterialTheme.typography.labelLarge)
+                    if (model.recommended) {
+                        Spacer(Modifier.width(6.dp))
+                        Surface(
+                            color = MaterialTheme.colorScheme.primary,
+                            shape = androidx.compose.foundation.shape.RoundedCornerShape(4.dp)
+                        ) {
+                            Text("BEST", modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onPrimary)
+                        }
+                    }
+                }
+                Text(model.description, style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("${model.sizeMB} MB",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Spacer(Modifier.width(8.dp))
+            FilledIconButton(
+                onClick = onDownload,
+                colors = IconButtonDefaults.filledIconButtonColors(
+                    containerColor = MaterialTheme.colorScheme.primary)
+            ) {
+                Icon(Icons.Default.Download, contentDescription = "Download ${model.name}")
+            }
+        }
+    }
+}
+
+@Composable
+private fun DownloadProgressCard(
+    modelName: String,
+    progress: Float,
+    downloadedMB: Int,
+    totalMB: Int,
+    onCancel: () -> Unit
+) {
+    Card(colors = CardDefaults.cardColors(
+        containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Downloading, null,
+                    tint = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.width(8.dp))
+                Text("Downloading $modelName", style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.weight(1f))
+                TextButton(onClick = onCancel) { Text("Cancel") }
+            }
+            LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Text(
+                if (totalMB > 0) "${downloadedMB}MB / ${totalMB}MB  (${(progress * 100).toInt()}%)"
+                else "Connecting…",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+private fun LoadingCard(message: String, progress: Float?) {
+    Card(colors = CardDefaults.cardColors(
+        containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+        Column(Modifier.padding(16.dp).fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (progress != null) {
+                LinearProgressIndicator(
+                    progress = { progress }, modifier = Modifier.fillMaxWidth())
+            } else {
+                CircularProgressIndicator(modifier = Modifier.size(32.dp))
+            }
+            Text(message, style = MaterialTheme.typography.labelMedium)
+        }
+    }
+}
+
+@Composable
 private fun ImportButton(onClick: () -> Unit) {
     Button(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
-        Icon(Icons.Default.FolderOpen, contentDescription = null)
+        Icon(Icons.Default.FolderOpen, null)
         Spacer(Modifier.width(8.dp))
         Text("Import GGUF Model")
     }
