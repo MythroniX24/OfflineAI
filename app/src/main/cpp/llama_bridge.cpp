@@ -158,7 +158,7 @@ Java_com_om_offlineai_engine_LlamaEngine_nativeInfer(
         env->DeleteLocalRef(jpiece);
 
         // Next batch
-        llama_batch_clear(batch);
+        batch.n_tokens = 0;  // llama_batch_clear removed in new API
         common_batch_add(batch, new_token, n_cur, {0}, true);
         n_cur++;
         n_gen++;
