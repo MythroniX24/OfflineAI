@@ -232,7 +232,6 @@ class ModelViewModel @Inject constructor(
     }
 }
 
-}
 
 // ═══════════════════════════════════════════════════════════════════
 //  ConversationListViewModel
