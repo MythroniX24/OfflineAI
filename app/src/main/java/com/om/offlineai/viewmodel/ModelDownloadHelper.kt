@@ -14,15 +14,14 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 
 private const val TAG = "ModelDownload"
-private const val PREFS_NAME = "model_download_prefs"
-private const val KEY_DOWNLOAD_ID    = "active_download_id"
-private const val KEY_DOWNLOAD_MODEL = "active_download_model"
-private const val KEY_DEST_PATH      = "active_dest_path"
-
-// Minimum valid GGUF file size (100 MB) — anything smaller is garbage/HTML
-private const val MIN_VALID_SIZE_BYTES = 100L * 1024 * 1024
+private const val PREFS = "model_dl_prefs"
+private const val KEY_ID    = "dl_id"
+private const val KEY_NAME  = "dl_model_name"
+private const val KEY_FNAME = "dl_file_name"   // save fileName to find file after download
 
 class ModelDownloadHelper(
     private val context: Context,
@@ -30,72 +29,61 @@ class ModelDownloadHelper(
     private val onComplete: (filePath: String) -> Unit,
     private val scope: CoroutineScope
 ) {
-    private val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val dm    = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+    private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     private var progressJob: Job? = null
 
+    // ── BroadcastReceiver for download complete ───────────────────────────────
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
-            val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
-            val saved = prefs.getLong(KEY_DOWNLOAD_ID, -1L)
-            if (id == saved && id != -1L) handleDownloadComplete(id)
+            val id   = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+            val saved = prefs.getLong(KEY_ID, -1L)
+            if (id == saved && id != -1L) {
+                Log.i(TAG, "Download complete broadcast id=$id")
+                scope.launch { handleComplete(id) }
+            }
         }
     }
 
     init {
         val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
             context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
-        } else {
+        else
             @Suppress("UnspecifiedRegisterReceiverFlag")
             context.registerReceiver(receiver, filter)
-        }
-        reattachPendingDownload()
+
+        reattach()
     }
 
+    // ── Start download ────────────────────────────────────────────────────────
     fun startDownload(model: DownloadableModel) {
         if (uiState.value.isDownloading) return
 
-        val destDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-            ?: context.filesDir
-        destDir.mkdirs()
-        val destFile = File(destDir, model.fileName)
-
-        // Already downloaded and valid?
-        if (destFile.exists() && destFile.length() >= MIN_VALID_SIZE_BYTES) {
-            Log.i(TAG, "Model already valid at ${destFile.path} (${destFile.length()} bytes)")
-            scope.launch { onComplete(destFile.absolutePath) }
+        // Check if already copied to internal storage
+        val internal = internalFile(model.fileName)
+        if (internal.exists() && internal.length() > 50_000_000L) {
+            Log.i(TAG, "Already in internal: ${internal.path} (${internal.length()/1024/1024}MB)")
+            scope.launch { onComplete(internal.absolutePath) }
             return
         }
 
-        // Remove partial/invalid file
-        if (destFile.exists()) {
-            Log.w(TAG, "Removing invalid file (${destFile.length()} bytes) at ${destFile.path}")
-            destFile.delete()
-        }
-
         uiState.update {
-            it.copy(
-                isDownloading = true,
-                downloadProgress = 0f,
-                downloadingModel = model.name,
-                totalMB = model.sizeMB,
-                downloadedMB = 0,
-                error = null
-            )
+            it.copy(isDownloading = true, downloadProgress = 0f,
+                downloadingModel = model.name, totalMB = model.sizeMB,
+                downloadedMB = 0, error = null)
         }
 
-        // ── CRITICAL FIX: append ?download=true for HuggingFace URLs ──────────
-        val downloadUrl = if (model.url.contains("huggingface.co") &&
-                             !model.url.contains("?download=true")) {
-            "${model.url}?download=true"
-        } else model.url
+        // HuggingFace needs ?download=true for direct binary download
+        val url = model.url.let {
+            if (it.contains("huggingface.co") && !it.contains("?download=true"))
+                "$it?download=true" else it
+        }
 
-        Log.i(TAG, "Starting download: $downloadUrl -> ${destFile.path}")
-
-        val request = DownloadManager.Request(Uri.parse(downloadUrl))
+        // Download to external Downloads (DownloadManager writes here well)
+        val request = DownloadManager.Request(Uri.parse(url))
             .setTitle(model.name)
-            .setDescription("OfflineAI — downloading ${model.name}")
+            .setDescription("OfflineAI model")
             .setNotificationVisibility(
                 DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
             .setDestinationInExternalFilesDir(
@@ -103,152 +91,178 @@ class ModelDownloadHelper(
             .setAllowedOverMetered(true)
             .setAllowedOverRoaming(true)
 
-        val downloadId = dm.enqueue(request)
-        Log.i(TAG, "Enqueued download id=$downloadId")
+        val id = dm.enqueue(request)
+        Log.i(TAG, "Enqueued id=$id url=$url")
 
         prefs.edit()
-            .putLong(KEY_DOWNLOAD_ID, downloadId)
-            .putString(KEY_DOWNLOAD_MODEL, model.name)
-            .putString(KEY_DEST_PATH, destFile.absolutePath)
+            .putLong(KEY_ID, id)
+            .putString(KEY_NAME, model.name)
+            .putString(KEY_FNAME, model.fileName)
             .apply()
 
-        startProgressPolling(downloadId)
+        startPolling(id)
     }
 
     fun cancel() {
-        val id = prefs.getLong(KEY_DOWNLOAD_ID, -1L)
+        val id = prefs.getLong(KEY_ID, -1L)
         if (id >= 0) dm.remove(id)
-        clearPersistedDownload()
-        progressJob?.cancel()
+        clearPrefs(); progressJob?.cancel()
         uiState.update { it.copy(isDownloading = false, downloadProgress = 0f) }
     }
 
-    private fun reattachPendingDownload() {
-        val id = prefs.getLong(KEY_DOWNLOAD_ID, -1L)
-        val modelName = prefs.getString(KEY_DOWNLOAD_MODEL, "") ?: ""
-        if (id < 0 || modelName.isBlank()) return
+    // ── Reattach to in-progress download after app restart ───────────────────
+    private fun reattach() {
+        val id    = prefs.getLong(KEY_ID, -1L)
+        val name  = prefs.getString(KEY_NAME, "") ?: ""
+        if (id < 0 || name.isBlank()) return
 
-        val query = DownloadManager.Query().setFilterById(id)
-        val cursor = dm.query(query) ?: run { clearPersistedDownload(); return }
-        if (!cursor.moveToFirst()) { cursor.close(); clearPersistedDownload(); return }
-
+        val cursor = dm.query(DownloadManager.Query().setFilterById(id)) ?: run {
+            clearPrefs(); return
+        }
+        if (!cursor.moveToFirst()) { cursor.close(); clearPrefs(); return }
         val status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
         cursor.close()
 
         when (status) {
-            DownloadManager.STATUS_SUCCESSFUL -> handleDownloadComplete(id)
+            DownloadManager.STATUS_SUCCESSFUL -> scope.launch { handleComplete(id) }
             DownloadManager.STATUS_RUNNING,
             DownloadManager.STATUS_PENDING,
             DownloadManager.STATUS_PAUSED -> {
                 uiState.update {
-                    it.copy(isDownloading = true, downloadingModel = modelName, downloadProgress = 0f)
+                    it.copy(isDownloading = true, downloadingModel = name, downloadProgress = 0f)
                 }
-                startProgressPolling(id)
+                startPolling(id)
             }
-            else -> clearPersistedDownload()
+            else -> clearPrefs()
         }
     }
 
-    private fun startProgressPolling(downloadId: Long) {
+    // ── Poll download progress ────────────────────────────────────────────────
+    private fun startPolling(id: Long) {
         progressJob?.cancel()
         progressJob = scope.launch {
             while (isActive && uiState.value.isDownloading) {
-                queryProgress(downloadId)
-                delay(1000)
+                poll(id); delay(1000)
             }
         }
     }
 
-    private fun queryProgress(downloadId: Long) {
-        val query = DownloadManager.Query().setFilterById(downloadId)
-        val cursor: Cursor = dm.query(query) ?: return
-        if (!cursor.moveToFirst()) { cursor.close(); return }
-
-        val status     = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
-        val downloaded = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
-        val total      = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
-        cursor.close()
+    private fun poll(id: Long) {
+        val c = dm.query(DownloadManager.Query().setFilterById(id)) ?: return
+        if (!c.moveToFirst()) { c.close(); return }
+        val status  = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+        val done    = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
+        val total   = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
+        c.close()
 
         when (status) {
             DownloadManager.STATUS_RUNNING,
             DownloadManager.STATUS_PENDING,
             DownloadManager.STATUS_PAUSED -> {
-                val progress = if (total > 0) downloaded.toFloat() / total else 0f
+                val pct = if (total > 0) done.toFloat() / total else 0f
                 uiState.update {
-                    it.copy(
-                        downloadProgress = progress,
-                        downloadedMB     = (downloaded / (1024 * 1024)).toInt(),
-                        totalMB          = if (total > 0) (total / (1024 * 1024)).toInt() else it.totalMB
-                    )
+                    it.copy(downloadProgress = pct,
+                        downloadedMB = (done  / 1024 / 1024).toInt(),
+                        totalMB      = if (total > 0) (total / 1024 / 1024).toInt() else it.totalMB)
                 }
             }
-            DownloadManager.STATUS_SUCCESSFUL -> handleDownloadComplete(downloadId)
+            DownloadManager.STATUS_SUCCESSFUL -> scope.launch { handleComplete(id) }
             DownloadManager.STATUS_FAILED -> {
-                progressJob?.cancel()
-                clearPersistedDownload()
-                uiState.update {
-                    it.copy(isDownloading = false,
-                        error = "Download failed. Internet check karo ya doosra model try karo.")
-                }
+                progressJob?.cancel(); clearPrefs()
+                uiState.update { it.copy(isDownloading = false,
+                    error = "Download failed. Internet check karo.") }
             }
         }
     }
 
-    private fun handleDownloadComplete(downloadId: Long) {
+    // ── Handle completed download ─────────────────────────────────────────────
+    private suspend fun handleComplete(id: Long) {
         progressJob?.cancel()
 
-        // ── Use the saved dest path — most reliable approach ─────────────────
-        val savedPath = prefs.getString(KEY_DEST_PATH, null)
-        clearPersistedDownload()
+        val fileName = prefs.getString(KEY_FNAME, null)
+        clearPrefs()
 
-        val filePath: String? = savedPath ?: run {
-            // Fallback: query DownloadManager for local URI
-            val query = DownloadManager.Query().setFilterById(downloadId)
-            val cursor = dm.query(query) ?: return
-            if (!cursor.moveToFirst()) { cursor.close(); return }
-            val uri = cursor.getString(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI))
-            cursor.close()
-            uri?.let { Uri.parse(it).path }
-        }
-
-        if (filePath == null) {
-            uiState.update { it.copy(isDownloading = false, error = "Downloaded file path not found") }
-            return
-        }
-
-        val file = File(filePath)
-        Log.i(TAG, "Download complete: $filePath (${file.length()} bytes)")
-
-        // ── Validate file size — catch HTML error pages ───────────────────────
-        if (!file.exists()) {
+        if (fileName == null) {
             uiState.update { it.copy(isDownloading = false,
-                error = "Downloaded file missing at $filePath") }
+                error = "File name missing — dobara download karo") }
             return
         }
 
-        if (file.length() < MIN_VALID_SIZE_BYTES) {
-            val sizeMB = file.length() / (1024 * 1024)
-            file.delete() // remove garbage file
-            uiState.update {
-                it.copy(
-                    isDownloading = false,
-                    error = "Download incomplete (${sizeMB}MB). HuggingFace se direct download karne ki koshish ki thi — seedha 'Doosra model' try karo ya WiFi use karo."
-                )
-            }
+        // ── Find the downloaded file ──────────────────────────────────────────
+        val externalFile = File(
+            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), fileName)
+
+        Log.i(TAG, "Looking for: ${externalFile.path} exists=${externalFile.exists()} size=${externalFile.length()}")
+
+        if (!externalFile.exists()) {
+            uiState.update { it.copy(isDownloading = false,
+                error = "Downloaded file nahi mila: ${externalFile.path}") }
             return
         }
 
-        Log.i(TAG, "File valid (${file.length() / (1024*1024)}MB), loading model...")
+        if (externalFile.length() < 10_000_000L) {        // < 10 MB = garbage/HTML
+            val sizeMB = externalFile.length() / 1024 / 1024
+            externalFile.delete()
+            uiState.update { it.copy(isDownloading = false,
+                error = "Download galat hua (${sizeMB}MB). HuggingFace ne HTML bheja. WiFi se dobara try karo.") }
+            return
+        }
+
+        // ── CRITICAL: Copy to INTERNAL storage so JNI can always read it ─────
+        // External storage path is sometimes inaccessible from native NDK code
+        val internalDest = internalFile(fileName)
+
+        uiState.update { it.copy(
+            isDownloading = true,
+            downloadingModel = "Copying to internal storage…",
+            downloadProgress = 0f
+        )}
+
+        try {
+            copyWithProgress(externalFile, internalDest)
+            externalFile.delete()   // free external space after copy
+            Log.i(TAG, "Copied to internal: ${internalDest.path} (${internalDest.length()/1024/1024}MB)")
+        } catch (e: Exception) {
+            // If copy fails, try loading from external directly as fallback
+            Log.w(TAG, "Copy failed, trying external path: ${e.message}")
+            uiState.update { it.copy(isDownloading = false) }
+            onComplete(externalFile.absolutePath)
+            return
+        }
+
         uiState.update { it.copy(isDownloading = false, downloadProgress = 1f) }
-        scope.launch { onComplete(filePath) }
+        onComplete(internalDest.absolutePath)
     }
 
-    private fun clearPersistedDownload() {
-        prefs.edit()
-            .remove(KEY_DOWNLOAD_ID)
-            .remove(KEY_DOWNLOAD_MODEL)
-            .remove(KEY_DEST_PATH)
-            .apply()
+    // ── Copy file with progress updates ──────────────────────────────────────
+    private suspend fun copyWithProgress(src: File, dst: File) = withContext(Dispatchers.IO) {
+        val total = src.length()
+        var copied = 0L
+        val buf = ByteArray(128 * 1024)   // 128KB chunks
+        FileInputStream(src).use { inp ->
+            FileOutputStream(dst).use { out ->
+                var n: Int
+                while (inp.read(buf).also { n = it } != -1) {
+                    out.write(buf, 0, n)
+                    copied += n
+                    val pct = if (total > 0) copied.toFloat() / total else 0f
+                    uiState.update { it.copy(
+                        downloadProgress = pct,
+                        downloadedMB = (copied / 1024 / 1024).toInt(),
+                        totalMB = (total / 1024 / 1024).toInt()
+                    )}
+                }
+            }
+        }
+    }
+
+    private fun internalFile(fileName: String): File {
+        val dir = File(context.filesDir, "models").also { it.mkdirs() }
+        return File(dir, fileName)
+    }
+
+    private fun clearPrefs() {
+        prefs.edit().remove(KEY_ID).remove(KEY_NAME).remove(KEY_FNAME).apply()
     }
 
     fun destroy() {

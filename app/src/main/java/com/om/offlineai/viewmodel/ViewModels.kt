@@ -33,29 +33,29 @@ val DOWNLOADABLE_MODELS = listOf(
         name = "TinyLlama 1.1B Chat",
         description = "Sabse chhota aur fast. Basic chat ke liye.",
         sizeMB = 670,
-        url = "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_0.gguf",
-        fileName = "tinyllama-1.1b-chat-q4_0.gguf",
+        url = "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_0.gguf?download=true",
+        fileName = "tinyllama-1.1b-chat-q4_0.gguf?download=true",
         recommended = true
     ),
     DownloadableModel(
         name = "Qwen2 1.5B",
         description = "Hindi/Hinglish ke liye best. Chhota aur efficient.",
         sizeMB = 940,
-        url = "https://huggingface.co/Qwen/Qwen2-1.5B-Instruct-GGUF/resolve/main/qwen2-1_5b-instruct-q4_k_m.gguf",
+        url = "https://huggingface.co/Qwen/Qwen2-1.5B-Instruct-GGUF/resolve/main/qwen2-1_5b-instruct-q4_k_m.gguf?download=true",
         fileName = "qwen2-1_5b-instruct-q4_k_m.gguf"
     ),
     DownloadableModel(
         name = "Phi-2 (2.7B)",
         description = "Microsoft ka model. Zyada smart, thoda bada.",
         sizeMB = 1600,
-        url = "https://huggingface.co/TheBloke/phi-2-GGUF/resolve/main/phi-2.Q4_K_M.gguf",
+        url = "https://huggingface.co/TheBloke/phi-2-GGUF/resolve/main/phi-2.Q4_K_M.gguf?download=true",
         fileName = "phi-2-q4_k_m.gguf"
     ),
     DownloadableModel(
         name = "Gemma 2B",
         description = "Google ka model. Balanced quality.",
         sizeMB = 1500,
-        url = "https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf",
+        url = "https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf?download=true",
         fileName = "gemma-2-2b-it-q4_k_m.gguf"
     )
 )
@@ -170,6 +170,7 @@ class ModelViewModel @Inject constructor(
 
     // ── Load model ────────────────────────────────────────────────────────────
     fun loadModel(path: String) {
+        android.util.Log.i("ModelViewModel", "loadModel called with: $path")
         viewModelScope.launch {
             _uiState.update { it.copy(state = ModelState.Loading) }
             val success = engine.loadModel(path)
@@ -187,7 +188,7 @@ class ModelViewModel @Inject constructor(
                 }
                 seedDefaultsIfNeeded()
             } else {
-                _uiState.update { it.copy(state = engine.modelState, error = "Model load nahi hua") }
+                _uiState.update { it.copy(state = engine.modelState, error = (engine.modelState as? ModelState.Error)?.message ?: "Model load nahi hua") }
             }
         }
     }
