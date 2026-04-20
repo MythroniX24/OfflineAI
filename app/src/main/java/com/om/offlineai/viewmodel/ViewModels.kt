@@ -34,7 +34,7 @@ val DOWNLOADABLE_MODELS = listOf(
         description = "Sabse chhota aur fast. Basic chat ke liye.",
         sizeMB = 670,
         url = "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_0.gguf?download=true",
-        fileName = "tinyllama-1.1b-chat-q4_0.gguf?download=true",
+        fileName = "tinyllama-1.1b-chat-q4_0.gguf",
         recommended = true
     ),
     DownloadableModel(

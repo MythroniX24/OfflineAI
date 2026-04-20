@@ -1,13 +1,17 @@
 /**
- * llama_bridge.cpp
- * JNI bridge for llama.cpp (new API, no common dependency)
+ * llama_bridge.cpp — FD-based model loading (production approach)
+ * Receives a file descriptor from Java/Kotlin via ParcelFileDescriptor.detachFd()
+ * Converts it to /proc/self/fd/{n} path which llama.cpp can open.
+ * This bypasses all Android storage permission issues.
  */
 
 #include <jni.h>
 #include <android/log.h>
+#include <unistd.h>
 #include <string>
 #include <vector>
 #include <atomic>
+#include <cstdio>
 
 #include "llama.h"
 
@@ -19,15 +23,14 @@ static llama_model*   g_model = nullptr;
 static llama_context* g_ctx   = nullptr;
 static std::atomic<bool> g_stop{false};
 
-// ── Inline batch helper (replaces common_batch_add) ─────────────────────────
-static void batch_add(llama_batch& batch, llama_token token, int pos,
-                      bool get_logits) {
-    batch.token   [batch.n_tokens] = token;
-    batch.pos     [batch.n_tokens] = (llama_pos)pos;
-    batch.n_seq_id[batch.n_tokens] = 1;
-    batch.seq_id  [batch.n_tokens][0] = 0;
-    batch.logits  [batch.n_tokens] = get_logits ? 1 : 0;
-    batch.n_tokens++;
+// Inline batch helper (no common library dependency)
+static void batch_add(llama_batch& b, llama_token tok, int pos, bool logits) {
+    b.token   [b.n_tokens] = tok;
+    b.pos     [b.n_tokens] = (llama_pos)pos;
+    b.n_seq_id[b.n_tokens] = 1;
+    b.seq_id  [b.n_tokens][0] = 0;
+    b.logits  [b.n_tokens] = logits ? 1 : 0;
+    b.n_tokens++;
 }
 
 static std::string jstr(JNIEnv* env, jstring s) {
@@ -45,21 +48,47 @@ Java_com_om_offlineai_engine_LlamaEngine_nativeInit(JNIEnv*, jobject) {
     LOGI("llama backend initialized");
 }
 
+/**
+ * Load model via file descriptor.
+ * fd: raw FD from ParcelFileDescriptor.detachFd() — JNI owns it after this call.
+ * We convert it to /proc/self/fd/{n} which llama.cpp opens like a normal file.
+ */
 JNIEXPORT jint JNICALL
-Java_com_om_offlineai_engine_LlamaEngine_nativeLoadModel(
-        JNIEnv* env, jobject, jstring jpath, jint nThreads, jint nCtx) {
+Java_com_om_offlineai_engine_LlamaEngine_nativeLoadModelFd(
+        JNIEnv* env, jobject, jint fd, jint nThreads, jint nCtx) {
 
     if (g_ctx)   { llama_free(g_ctx);        g_ctx   = nullptr; }
     if (g_model) { llama_model_free(g_model); g_model = nullptr; }
 
-    std::string path = jstr(env, jpath);
-    LOGI("Loading model: %s", path.c_str());
+    if (fd < 0) {
+        LOGE("Invalid fd=%d", fd);
+        return -1;
+    }
+
+    // Duplicate FD so llama.cpp owns its own copy
+    int dup_fd = dup(fd);
+    close(fd);  // close caller's copy
+
+    if (dup_fd < 0) {
+        LOGE("dup() failed for fd=%d errno=%d", fd, errno);
+        return -2;
+    }
+
+    // Build /proc/self/fd/{n} path — llama.cpp opens this like any file
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", dup_fd);
+    LOGI("Loading model from FD path: %s", path);
 
     llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 0;
+    mparams.n_gpu_layers = 0;   // CPU only on Android
 
-    g_model = llama_model_load_from_file(path.c_str(), mparams);
-    if (!g_model) { LOGE("Failed to load model"); return -1; }
+    g_model = llama_model_load_from_file(path, mparams);
+    close(dup_fd);  // llama.cpp has its own handle now, close ours
+
+    if (!g_model) {
+        LOGE("llama_model_load_from_file failed for fd path: %s", path);
+        return -3;
+    }
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx           = (uint32_t)nCtx;
@@ -68,14 +97,15 @@ Java_com_om_offlineai_engine_LlamaEngine_nativeLoadModel(
 
     g_ctx = llama_init_from_model(g_model, cparams);
     if (!g_ctx) {
-        LOGE("Failed to create context");
+        LOGE("llama_init_from_model failed");
         llama_model_free(g_model);
         g_model = nullptr;
-        return -1;
+        return -4;
     }
 
     const llama_vocab* vocab = llama_model_get_vocab(g_model);
-    LOGI("Model loaded. Vocab: %d, ctx: %d", llama_vocab_n_tokens(vocab), nCtx);
+    LOGI("Model loaded OK. vocab=%d ctx=%d threads=%d",
+         llama_vocab_n_tokens(vocab), nCtx, nThreads);
     return 0;
 }
 
@@ -102,11 +132,9 @@ Java_com_om_offlineai_engine_LlamaEngine_nativeInfer(
     if (n_tokens < 0) return env->NewStringUTF("[ERROR: Tokenization failed]");
     tokens.resize(n_tokens);
 
-    // Fill batch with prompt tokens
     llama_batch batch = llama_batch_init(std::max(512, n_tokens + 1), 0, 1);
-    for (int i = 0; i < n_tokens; i++) {
-        batch_add(batch, tokens[i], i, (i == n_tokens - 1));
-    }
+    for (int i = 0; i < n_tokens; i++)
+        batch_add(batch, tokens[i], i, i == n_tokens - 1);
 
     if (llama_decode(g_ctx, batch) != 0) {
         llama_batch_free(batch);
@@ -122,29 +150,23 @@ Java_com_om_offlineai_engine_LlamaEngine_nativeInfer(
     llama_token eos = llama_vocab_eos(vocab);
     std::string result;
     int n_cur = n_tokens;
-    int n_gen = 0;
 
-    while (n_gen < maxTokens && !g_stop.load()) {
-        llama_token new_token = llama_sampler_sample(sampler, g_ctx, batch.n_tokens - 1);
-        if (new_token == eos) break;
+    for (int n = 0; n < maxTokens && !g_stop.load(); n++) {
+        llama_token tok = llama_sampler_sample(sampler, g_ctx, batch.n_tokens - 1);
+        if (tok == eos) break;
 
         char buf[64] = {};
-        int len = llama_token_to_piece(vocab, new_token, buf, sizeof(buf) - 1, 0, false);
+        int len = llama_token_to_piece(vocab, tok, buf, sizeof(buf) - 1, 0, false);
         if (len > 0) {
             buf[len] = '\0';
-            std::string piece(buf, len);
-            result += piece;
-            jstring jpiece = env->NewStringUTF(piece.c_str());
-            env->CallVoidMethod(callback, onToken, jpiece);
-            env->DeleteLocalRef(jpiece);
+            result += buf;
+            jstring jp = env->NewStringUTF(buf);
+            env->CallVoidMethod(callback, onToken, jp);
+            env->DeleteLocalRef(jp);
         }
 
-        // Next batch
         batch.n_tokens = 0;
-        batch_add(batch, new_token, n_cur, true);
-        n_cur++;
-        n_gen++;
-
+        batch_add(batch, tok, n_cur++, true);
         if (llama_decode(g_ctx, batch) != 0) break;
     }
 
@@ -164,6 +186,7 @@ Java_com_om_offlineai_engine_LlamaEngine_nativeFree(JNIEnv*, jobject) {
     if (g_ctx)   { llama_free(g_ctx);        g_ctx   = nullptr; }
     if (g_model) { llama_model_free(g_model); g_model = nullptr; }
     llama_backend_free();
+    LOGI("Model freed");
 }
 
 JNIEXPORT jstring JNICALL
@@ -172,7 +195,7 @@ Java_com_om_offlineai_engine_LlamaEngine_nativeGetModelInfo(JNIEnv* env, jobject
     char buf[256] = {};
     llama_model_desc(g_model, buf, sizeof(buf));
     const llama_vocab* vocab = llama_model_get_vocab(g_model);
-    std::string info = "{\"desc\":\"" + std::string(buf) + "\","
+    std::string info = std::string("{\"desc\":\"") + buf + "\","
                      + "\"n_vocab\":" + std::to_string(llama_vocab_n_tokens(vocab)) + ","
                      + "\"n_ctx_train\":" + std::to_string(llama_model_n_ctx_train(g_model)) + "}";
     return env->NewStringUTF(info.c_str());

@@ -1,6 +1,7 @@
 package com.om.offlineai.engine
 
 import android.content.Context
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.om.offlineai.util.DeviceCapability
 import kotlinx.coroutines.*
@@ -30,15 +31,16 @@ class LlamaEngine @Inject constructor(
         init {
             try {
                 System.loadLibrary("llama_android")
-                Log.i(TAG, "Native library loaded OK")
+                Log.i(TAG, "✅ Native library loaded")
             } catch (e: UnsatisfiedLinkError) {
-                Log.e(TAG, "Native library load FAILED: ${e.message}")
+                Log.e(TAG, "❌ Native library FAILED: ${e.message}")
             }
         }
     }
 
+    // Native methods — nativeLoadModel now takes FD number, not path string
     private external fun nativeInit()
-    private external fun nativeLoadModel(path: String, nThreads: Int, nCtx: Int): Int
+    private external fun nativeLoadModelFd(fd: Int, nThreads: Int, nCtx: Int): Int
     private external fun nativeInfer(prompt: String, maxTokens: Int, callback: TokenCallback): String
     private external fun nativeStop()
     private external fun nativeFree()
@@ -49,6 +51,7 @@ class LlamaEngine @Inject constructor(
 
     private val engineScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var inferJob: Job? = null
+    private var openPfd: ParcelFileDescriptor? = null
 
     fun init() {
         try { nativeInit() } catch (e: Exception) {
@@ -56,57 +59,58 @@ class LlamaEngine @Inject constructor(
         }
     }
 
+    /**
+     * Load model using ParcelFileDescriptor approach.
+     * Passes FD to native, which opens /proc/self/fd/{fd} — bypasses all storage permission issues.
+     * This is the same approach used by production apps like kotlinllamacpp.
+     */
     suspend fun loadModel(path: String): Boolean = withContext(Dispatchers.IO) {
         modelState = ModelState.Loading
-        val file = File(path)
 
-        // ── Pre-checks before calling JNI ────────────────────────────────────
+        val file = File(path)
+        Log.i(TAG, "loadModel: path=$path exists=${file.exists()} size=${file.length()}")
+
         if (!file.exists()) {
-            val msg = "File not found: $path"
-            Log.e(TAG, msg)
-            modelState = ModelState.Error(msg)
+            modelState = ModelState.Error("File not found: $path")
             return@withContext false
         }
-        if (!file.canRead()) {
-            val msg = "Cannot read file (permission denied): $path"
-            Log.e(TAG, msg)
-            modelState = ModelState.Error(msg)
-            return@withContext false
-        }
+
         val sizeMB = file.length() / 1024 / 1024
         if (sizeMB < 10) {
-            val msg = "File too small (${sizeMB}MB) — probably not a valid GGUF model"
-            Log.e(TAG, msg)
-            modelState = ModelState.Error(msg)
-            return@withContext false
-        }
-        if (!deviceCapability.canLoadModel(sizeMB)) {
-            val available = deviceCapability.profile().ramMB
-            val msg = "Not enough RAM — model is ${sizeMB}MB, only ${available}MB available"
-            Log.e(TAG, msg)
-            modelState = ModelState.Error(msg)
+            modelState = ModelState.Error(
+                "File too small (${sizeMB}MB) — corrupted download. Dobara download karo.")
             return@withContext false
         }
 
-        Log.i(TAG, "Loading: $path | size=${sizeMB}MB | readable=${file.canRead()}")
+        // Release any previously opened FD
+        openPfd?.close()
+        openPfd = null
 
-        try {
+        return@withContext try {
+            // Open file as ParcelFileDescriptor — works on all Android versions
+            val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+            val fd = pfd.detachFd()  // detach so JNI owns the FD lifetime
+            openPfd = null           // pfd is detached, JNI handles close
+
+            Log.i(TAG, "Passing FD=$fd to native (size=${sizeMB}MB)")
+
             val threads = deviceCapability.optimalThreadCount()
             val ctx     = deviceCapability.optimalContextSize()
-            val result  = nativeLoadModel(path, threads, ctx)
+            val result  = nativeLoadModelFd(fd, threads, ctx)
+
             if (result == 0) {
                 modelState = ModelState.Loaded(file.name, path)
-                Log.i(TAG, "Model loaded successfully: ${file.name}")
+                Log.i(TAG, "✅ Model loaded: ${file.name}")
                 true
             } else {
-                val msg = "llama.cpp failed to load model (code=$result). File may be corrupted."
-                Log.e(TAG, msg)
-                modelState = ModelState.Error(msg)
+                modelState = ModelState.Error(
+                    "llama.cpp model load failed (code=$result). File mein issue hai ya RAM kam hai.")
+                Log.e(TAG, "❌ nativeLoadModelFd returned $result")
                 false
             }
         } catch (e: Exception) {
-            val msg = "Exception loading model: ${e.javaClass.simpleName}: ${e.message}"
-            Log.e(TAG, msg)
+            val msg = "${e.javaClass.simpleName}: ${e.message}"
+            Log.e(TAG, "❌ loadModel exception: $msg")
             modelState = ModelState.Error(msg)
             false
         }
@@ -114,7 +118,8 @@ class LlamaEngine @Inject constructor(
 
     fun infer(prompt: String, maxTokens: Int = 512): Flow<String> = flow {
         if (modelState !is ModelState.Loaded) {
-            emit("[Model not loaded]"); return@flow
+            emit("[Model not loaded — pehle model load karo]")
+            return@flow
         }
         val channel = Channel<String>(capacity = 256)
         val callback = object : TokenCallback {
@@ -138,11 +143,12 @@ class LlamaEngine @Inject constructor(
     fun freeModel() {
         try {
             nativeFree()
+            openPfd?.close()
+            openPfd = null
             modelState = ModelState.Unloaded
-        } catch (e: Exception) { Log.e(TAG, "nativeFree: ${e.message}") }
+        } catch (e: Exception) { Log.e(TAG, "freeModel: ${e.message}") }
     }
 
     fun isLoaded() = modelState is ModelState.Loaded
-
-    fun destroy() { engineScope.cancel(); freeModel() }
+    fun destroy()  { engineScope.cancel(); freeModel() }
 }
