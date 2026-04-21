@@ -80,7 +80,9 @@ Java_com_om_offlineai_engine_LlamaEngine_nativeLoadModelFd(
     LOGI("Loading model from FD path: %s", path);
 
     llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 0;   // CPU only on Android
+    mparams.n_gpu_layers = 0;
+    mparams.use_mmap  = false;   // CRITICAL: mmap fails on Android /proc/self/fd paths
+    mparams.use_mlock = false;   // CRITICAL: mlock not needed, reduces RAM pressure
 
     g_model = llama_model_load_from_file(path, mparams);
     close(dup_fd);  // llama.cpp has its own handle now, close ours

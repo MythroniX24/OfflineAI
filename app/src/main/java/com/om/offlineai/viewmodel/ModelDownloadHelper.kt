@@ -5,7 +5,6 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.database.Cursor
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -17,12 +16,24 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 
-private const val TAG = "ModelDownload"
-private const val PREFS = "model_dl_prefs"
-private const val KEY_ID    = "dl_id"
-private const val KEY_NAME  = "dl_model_name"
-private const val KEY_FNAME = "dl_file_name"   // save fileName to find file after download
+private const val TAG  = "ModelDownload"
+private const val PREFS = "model_dl_v4"
+private const val KEY_ID       = "dl_id"
+private const val KEY_NAME     = "dl_name"
+private const val KEY_FILENAME = "dl_filename"
 
+/**
+ * Download strategy:
+ *   1. DownloadManager saves to app-private EXTERNAL dir (it has write access there)
+ *   2. After success, we MOVE file to app's internal filesDir/models/
+ *      (renameTo = instant if same filesystem, fallback to stream copy)
+ *   3. Load from internal path — JNI always has read access here
+ *
+ * Why internal storage for loading:
+ *   - JNI/NDK code can always read from getFilesDir()
+ *   - External storage can sometimes be unavailable or have mmap restrictions
+ *   - No storage permissions needed
+ */
 class ModelDownloadHelper(
     private val context: Context,
     private val uiState: MutableStateFlow<ModelUiState>,
@@ -31,17 +42,18 @@ class ModelDownloadHelper(
 ) {
     private val dm    = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-    private var progressJob: Job? = null
+    private var pollJob: Job? = null
 
-    // ── BroadcastReceiver for download complete ───────────────────────────────
+    // Destination directories
+    private fun externalDir()  = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                                    ?: context.filesDir
+    private fun internalDir()  = File(context.filesDir, "models").also { it.mkdirs() }
+
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
-            val id   = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+            val id    = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
             val saved = prefs.getLong(KEY_ID, -1L)
-            if (id == saved && id != -1L) {
-                Log.i(TAG, "Download complete broadcast id=$id")
-                scope.launch { handleComplete(id) }
-            }
+            if (id == saved && id != -1L) scope.launch { handleComplete(id) }
         }
     }
 
@@ -52,21 +64,23 @@ class ModelDownloadHelper(
         else
             @Suppress("UnspecifiedRegisterReceiverFlag")
             context.registerReceiver(receiver, filter)
-
         reattach()
     }
 
-    // ── Start download ────────────────────────────────────────────────────────
     fun startDownload(model: DownloadableModel) {
         if (uiState.value.isDownloading) return
 
-        // Check if already copied to internal storage
-        val internal = internalFile(model.fileName)
-        if (internal.exists() && internal.length() > 50_000_000L) {
-            Log.i(TAG, "Already in internal: ${internal.path} (${internal.length()/1024/1024}MB)")
-            scope.launch { onComplete(internal.absolutePath) }
+        // Check if already in internal storage
+        val internalFile = File(internalDir(), model.fileName)
+        if (internalFile.exists() && internalFile.length() > 50_000_000L) {
+            Log.i(TAG, "Already in internal: ${internalFile.path} (${internalFile.length()/1024/1024}MB)")
+            scope.launch { onComplete(internalFile.absolutePath) }
             return
         }
+
+        // Clean up any existing partial files
+        internalFile.delete()
+        File(externalDir(), model.fileName).delete()
 
         uiState.update {
             it.copy(isDownloading = true, downloadProgress = 0f,
@@ -74,30 +88,29 @@ class ModelDownloadHelper(
                 downloadedMB = 0, error = null)
         }
 
-        // HuggingFace needs ?download=true for direct binary download
+        // Add ?download=true for HuggingFace direct binary download
         val url = model.url.let {
             if (it.contains("huggingface.co") && !it.contains("?download=true"))
                 "$it?download=true" else it
         }
 
-        // Download to external Downloads (DownloadManager writes here well)
-        val request = DownloadManager.Request(Uri.parse(url))
+        Log.i(TAG, "Downloading: $url -> ${externalDir()}/${model.fileName}")
+
+        val req = DownloadManager.Request(Uri.parse(url))
             .setTitle(model.name)
-            .setDescription("OfflineAI model")
-            .setNotificationVisibility(
-                DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            .setDestinationInExternalFilesDir(
-                context, Environment.DIRECTORY_DOWNLOADS, model.fileName)
+            .setDescription("OfflineAI — ${model.sizeMB}MB")
+            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            .setDestinationInExternalFilesDir(context, Environment.DIRECTORY_DOWNLOADS, model.fileName)
             .setAllowedOverMetered(true)
             .setAllowedOverRoaming(true)
 
-        val id = dm.enqueue(request)
-        Log.i(TAG, "Enqueued id=$id url=$url")
+        val id = dm.enqueue(req)
+        Log.i(TAG, "Enqueued id=$id")
 
         prefs.edit()
             .putLong(KEY_ID, id)
             .putString(KEY_NAME, model.name)
-            .putString(KEY_FNAME, model.fileName)
+            .putString(KEY_FILENAME, model.fileName)
             .apply()
 
         startPolling(id)
@@ -106,167 +119,161 @@ class ModelDownloadHelper(
     fun cancel() {
         val id = prefs.getLong(KEY_ID, -1L)
         if (id >= 0) dm.remove(id)
-        clearPrefs(); progressJob?.cancel()
+        clearPrefs(); pollJob?.cancel()
         uiState.update { it.copy(isDownloading = false, downloadProgress = 0f) }
     }
 
-    // ── Reattach to in-progress download after app restart ───────────────────
     private fun reattach() {
-        val id    = prefs.getLong(KEY_ID, -1L)
-        val name  = prefs.getString(KEY_NAME, "") ?: ""
+        val id   = prefs.getLong(KEY_ID, -1L)
+        val name = prefs.getString(KEY_NAME, "") ?: ""
         if (id < 0 || name.isBlank()) return
 
-        val cursor = dm.query(DownloadManager.Query().setFilterById(id)) ?: run {
-            clearPrefs(); return
-        }
-        if (!cursor.moveToFirst()) { cursor.close(); clearPrefs(); return }
-        val status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
-        cursor.close()
+        val c = dm.query(DownloadManager.Query().setFilterById(id)) ?: run { clearPrefs(); return }
+        if (!c.moveToFirst()) { c.close(); clearPrefs(); return }
+        val status = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+        c.close()
 
         when (status) {
             DownloadManager.STATUS_SUCCESSFUL -> scope.launch { handleComplete(id) }
-            DownloadManager.STATUS_RUNNING,
-            DownloadManager.STATUS_PENDING,
+            DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PENDING,
             DownloadManager.STATUS_PAUSED -> {
-                uiState.update {
-                    it.copy(isDownloading = true, downloadingModel = name, downloadProgress = 0f)
-                }
+                uiState.update { it.copy(isDownloading = true, downloadingModel = name) }
                 startPolling(id)
             }
             else -> clearPrefs()
         }
     }
 
-    // ── Poll download progress ────────────────────────────────────────────────
     private fun startPolling(id: Long) {
-        progressJob?.cancel()
-        progressJob = scope.launch {
-            while (isActive && uiState.value.isDownloading) {
-                poll(id); delay(1000)
-            }
+        pollJob?.cancel()
+        pollJob = scope.launch {
+            while (isActive && uiState.value.isDownloading) { poll(id); delay(1000) }
         }
     }
 
     private fun poll(id: Long) {
         val c = dm.query(DownloadManager.Query().setFilterById(id)) ?: return
         if (!c.moveToFirst()) { c.close(); return }
-        val status  = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
-        val done    = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
-        val total   = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
+        val status = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+        val done   = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
+        val total  = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
         c.close()
 
         when (status) {
-            DownloadManager.STATUS_RUNNING,
-            DownloadManager.STATUS_PENDING,
-            DownloadManager.STATUS_PAUSED -> {
-                val pct = if (total > 0) done.toFloat() / total else 0f
-                uiState.update {
-                    it.copy(downloadProgress = pct,
-                        downloadedMB = (done  / 1024 / 1024).toInt(),
-                        totalMB      = if (total > 0) (total / 1024 / 1024).toInt() else it.totalMB)
-                }
+            DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PENDING,
+            DownloadManager.STATUS_PAUSED -> uiState.update {
+                it.copy(
+                    downloadProgress = if (total > 0) done.toFloat() / total else 0f,
+                    downloadedMB = (done  / 1024 / 1024).toInt(),
+                    totalMB = if (total > 0) (total / 1024 / 1024).toInt() else it.totalMB
+                )
             }
             DownloadManager.STATUS_SUCCESSFUL -> scope.launch { handleComplete(id) }
             DownloadManager.STATUS_FAILED -> {
-                progressJob?.cancel(); clearPrefs()
+                pollJob?.cancel(); clearPrefs()
                 uiState.update { it.copy(isDownloading = false,
-                    error = "Download failed. Internet check karo.") }
+                    error = "❌ Download fail hua. WiFi se try karo.") }
             }
         }
     }
 
-    // ── Handle completed download ─────────────────────────────────────────────
-    private suspend fun handleComplete(id: Long) {
-        progressJob?.cancel()
-
-        val fileName = prefs.getString(KEY_FNAME, null)
+    private suspend fun handleComplete(id: Long) = withContext(Dispatchers.IO) {
+        pollJob?.cancel()
+        val fileName = prefs.getString(KEY_FILENAME, null)
         clearPrefs()
 
         if (fileName == null) {
-            uiState.update { it.copy(isDownloading = false,
-                error = "File name missing — dobara download karo") }
-            return
+            uiState.update { it.copy(isDownloading = false, error = "fileName missing — dobara try karo") }
+            return@withContext
         }
 
-        // ── Find the downloaded file ──────────────────────────────────────────
-        val externalFile = File(
-            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), fileName)
+        // Source: where DownloadManager saved it
+        val srcFile = File(externalDir(), fileName)
+        // Destination: internal storage where JNI can always read
+        val dstFile = File(internalDir(), fileName)
 
-        Log.i(TAG, "Looking for: ${externalFile.path} exists=${externalFile.exists()} size=${externalFile.length()}")
+        Log.i(TAG, "Download complete. src=${srcFile.path} exists=${srcFile.exists()} size=${srcFile.length()}")
 
-        if (!externalFile.exists()) {
+        if (!srcFile.exists()) {
+            // Maybe it already moved to internal in a previous attempt
+            if (dstFile.exists() && dstFile.length() > 50_000_000L) {
+                Log.i(TAG, "File already in internal, loading from there")
+                uiState.update { it.copy(isDownloading = false, downloadProgress = 1f) }
+                onComplete(dstFile.absolutePath)
+                return@withContext
+            }
             uiState.update { it.copy(isDownloading = false,
-                error = "Downloaded file nahi mila: ${externalFile.path}") }
-            return
+                error = "❌ Downloaded file nahi mila.\nExpected: ${srcFile.path}\n\nDobara download karo.") }
+            return@withContext
         }
 
-        if (externalFile.length() < 10_000_000L) {        // < 10 MB = garbage/HTML
-            val sizeMB = externalFile.length() / 1024 / 1024
-            externalFile.delete()
+        val sizeMB = srcFile.length() / 1024 / 1024
+        if (sizeMB < 10) {
+            srcFile.delete()
             uiState.update { it.copy(isDownloading = false,
-                error = "Download galat hua (${sizeMB}MB). HuggingFace ne HTML bheja. WiFi se dobara try karo.") }
-            return
+                error = "❌ File too small (${sizeMB}MB) — HuggingFace ne HTML bheja.\nWiFi pe switch karo aur dobara try karo.") }
+            return@withContext
         }
 
-        // ── CRITICAL: Copy to INTERNAL storage so JNI can always read it ─────
-        // External storage path is sometimes inaccessible from native NDK code
-        val internalDest = internalFile(fileName)
-
-        uiState.update { it.copy(
-            isDownloading = true,
-            downloadingModel = "Copying to internal storage…",
-            downloadProgress = 0f
-        )}
-
-        try {
-            copyWithProgress(externalFile, internalDest)
-            externalFile.delete()   // free external space after copy
-            Log.i(TAG, "Copied to internal: ${internalDest.path} (${internalDest.length()/1024/1024}MB)")
+        // Move to internal storage
+        uiState.update { it.copy(downloadingModel = "Moving to internal storage…") }
+        val moved = try {
+            // Try rename first (instant on same filesystem)
+            val renamed = srcFile.renameTo(dstFile)
+            if (renamed) {
+                Log.i(TAG, "Renamed (instant move) to ${dstFile.path}")
+                true
+            } else {
+                // Fallback: stream copy
+                Log.i(TAG, "Rename failed, doing stream copy…")
+                streamCopy(srcFile, dstFile)
+                srcFile.delete()
+                Log.i(TAG, "Stream copy done: ${dstFile.length()/1024/1024}MB")
+                true
+            }
         } catch (e: Exception) {
-            // If copy fails, try loading from external directly as fallback
-            Log.w(TAG, "Copy failed, trying external path: ${e.message}")
-            uiState.update { it.copy(isDownloading = false) }
-            onComplete(externalFile.absolutePath)
-            return
+            Log.e(TAG, "Move failed: ${e.message}")
+            // Last resort: try loading from external directly
+            Log.w(TAG, "Trying to load from external path as fallback")
+            uiState.update { it.copy(isDownloading = false, downloadProgress = 1f) }
+            onComplete(srcFile.absolutePath)
+            return@withContext
         }
 
-        uiState.update { it.copy(isDownloading = false, downloadProgress = 1f) }
-        onComplete(internalDest.absolutePath)
+        if (moved && dstFile.exists() && dstFile.length() > 50_000_000L) {
+            Log.i(TAG, "✅ Ready: ${dstFile.path} (${dstFile.length()/1024/1024}MB)")
+            uiState.update { it.copy(isDownloading = false, downloadProgress = 1f) }
+            onComplete(dstFile.absolutePath)
+        } else {
+            uiState.update { it.copy(isDownloading = false,
+                error = "❌ File move failed. Dobara download karo.") }
+        }
     }
 
-    // ── Copy file with progress updates ──────────────────────────────────────
-    private suspend fun copyWithProgress(src: File, dst: File) = withContext(Dispatchers.IO) {
+    private fun streamCopy(src: File, dst: File) {
+        val buf = ByteArray(256 * 1024)
         val total = src.length()
         var copied = 0L
-        val buf = ByteArray(128 * 1024)   // 128KB chunks
         FileInputStream(src).use { inp ->
             FileOutputStream(dst).use { out ->
                 var n: Int
                 while (inp.read(buf).also { n = it } != -1) {
                     out.write(buf, 0, n)
                     copied += n
-                    val pct = if (total > 0) copied.toFloat() / total else 0f
                     uiState.update { it.copy(
-                        downloadProgress = pct,
-                        downloadedMB = (copied / 1024 / 1024).toInt(),
-                        totalMB = (total / 1024 / 1024).toInt()
+                        downloadProgress = if (total > 0) copied.toFloat() / total else 0f
                     )}
                 }
             }
         }
     }
 
-    private fun internalFile(fileName: String): File {
-        val dir = File(context.filesDir, "models").also { it.mkdirs() }
-        return File(dir, fileName)
-    }
-
     private fun clearPrefs() {
-        prefs.edit().remove(KEY_ID).remove(KEY_NAME).remove(KEY_FNAME).apply()
+        prefs.edit().remove(KEY_ID).remove(KEY_NAME).remove(KEY_FILENAME).apply()
     }
 
     fun destroy() {
-        progressJob?.cancel()
+        pollJob?.cancel()
         try { context.unregisterReceiver(receiver) } catch (_: Exception) {}
     }
 }
