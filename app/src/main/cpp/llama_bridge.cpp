@@ -79,7 +79,6 @@ Java_com_om_offlineai_engine_LlamaEngine_nativeLoadModelFd(
     params.use_mmap                 = false;  // CRITICAL
     params.use_mlock                = false;  // CRITICAL
     params.n_gpu_layers             = 0;
-    params.flash_attn               = false;
     params.warmup                   = false;
 
     try {
